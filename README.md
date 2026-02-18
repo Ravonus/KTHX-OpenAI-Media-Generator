@@ -10,7 +10,7 @@ Small local service to launch a visible Playwright browser and persist cookies/s
 ## Setup
 
 ```bash
-cd agent-playwright
+cd KTHX-OpenAI-Media-Generator
 pnpm install
 pnpm exec playwright install chromium
 ```
@@ -18,7 +18,7 @@ pnpm exec playwright install chromium
 ## Run
 
 ```bash
-# Visible browser with persistent storage in agent-playwright/.agent-playwright
+# Visible browser with persistent storage in KTHX-OpenAI-Media-Generator/.agent-playwright
 PW_HEADLESS=false pnpm start
 ```
 
@@ -27,7 +27,7 @@ PW_HEADLESS=false pnpm start
 Install locally and expose the CLI:
 
 ```bash
-cd agent-playwright
+cd KTHX-OpenAI-Media-Generator
 pnpm install
 pnpm link --global
 ```
