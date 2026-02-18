@@ -1,0 +1,18 @@
+{
+  "name": "kthx-openai-media-generator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "generateImage": "src/cli.mjs",
+    "generateFile": "src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node src/server.mjs",
+    "cli": "node src/cli.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.51.1"
+  }
+}
