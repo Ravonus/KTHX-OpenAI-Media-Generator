@@ -694,6 +694,28 @@ const isLikelyDownloadResponseUrl = (value) => {
   }
 };
 
+const resolvePageFromRequest = (request) => {
+  try {
+    const frame =
+      request && typeof request.frame === "function" ? request.frame() : null;
+    if (!frame || typeof frame.page !== "function") return null;
+    return frame.page();
+  } catch {
+    return null;
+  }
+};
+
+const resolvePageFromResponse = (response) => {
+  try {
+    const frame =
+      response && typeof response.frame === "function" ? response.frame() : null;
+    if (!frame || typeof frame.page !== "function") return null;
+    return frame.page();
+  } catch {
+    return null;
+  }
+};
+
 const savePlaywrightDownload = async (download, { imageRun = null } = {}) => {
   if (!download) return buildSaveResult();
   const suggestedName =
@@ -741,25 +763,30 @@ const savePlaywrightDownload = async (download, { imageRun = null } = {}) => {
   return buildSaveResult(1, [saved], metadataId ? [metadataId] : []);
 };
 
-const waitForContextDownloadEvent = async (ctx, timeoutMs) => {
-  const currentPages = ctx.pages();
-  const candidates = currentPages.map((candidatePage) =>
-    candidatePage.waitForEvent("download", { timeout: timeoutMs }),
-  );
-  candidates.push(
-    ctx
-      .waitForEvent("page", {
-        timeout: Math.max(1_500, Math.min(5_000, timeoutMs)),
-      })
-      .then((newPage) =>
-        newPage.waitForEvent("download", { timeout: timeoutMs }),
-      ),
-  );
-  try {
-    return await Promise.any(candidates);
-  } catch {
-    return null;
+const waitForContextDownloadEvent = async (
+  ctx,
+  timeoutMs,
+  { isPageAllowed = () => true } = {},
+) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now());
+    let download = null;
+    try {
+      download = await ctx.waitForEvent("download", {
+        timeout: remainingMs,
+      });
+    } catch {
+      return null;
+    }
+    if (!download) return null;
+    const sourcePage =
+      typeof download.page === "function" ? download.page() : null;
+    if (!sourcePage || isPageAllowed(sourcePage)) {
+      return download;
+    }
   }
+  return null;
 };
 
 const extractLatestAssistantDownloadUrls = async (pageInstance) => {
@@ -806,8 +833,20 @@ const collectAssistantDownloadsByClick = async (
     imageRun = null,
     attemptedControlKeys = new Set(),
     timeoutMs = 8_000,
+    isPageAllowed = () => true,
   } = {},
 ) => {
+  const shouldAcceptUnknownPageEvent = () => {
+    try {
+      const allowedPages = pageInstance
+        .context()
+        .pages()
+        .filter((candidatePage) => isPageAllowed(candidatePage));
+      return allowedPages.length <= 1;
+    } catch {
+      return false;
+    }
+  };
   let result = buildSaveResult();
   const turns = pageInstance.locator('article[data-turn="assistant"]');
   const turnCount = await turns.count();
@@ -853,27 +892,32 @@ const collectAssistantDownloadsByClick = async (
 
       const responsePromise = pageInstance
         .context()
-        .waitForEvent(
-          "response",
-          {
-            predicate: (response) => isLikelyDownloadResponseUrl(response.url()),
-            timeout: Math.max(2_000, timeoutMs),
+        .waitForEvent("response", {
+          predicate: (response) => {
+            if (!isLikelyDownloadResponseUrl(response.url())) return false;
+            const eventPage = resolvePageFromResponse(response);
+            if (!eventPage) return shouldAcceptUnknownPageEvent();
+            return isPageAllowed(eventPage);
           },
-        )
+          timeout: Math.max(2_000, timeoutMs),
+        })
         .catch(() => null);
       const requestPromise = pageInstance
         .context()
-        .waitForEvent(
-          "request",
-          {
-            predicate: (request) => isLikelyDownloadResponseUrl(request.url()),
-            timeout: Math.max(2_000, timeoutMs),
+        .waitForEvent("request", {
+          predicate: (request) => {
+            if (!isLikelyDownloadResponseUrl(request.url())) return false;
+            const eventPage = resolvePageFromRequest(request);
+            if (!eventPage) return shouldAcceptUnknownPageEvent();
+            return isPageAllowed(eventPage);
           },
-        )
+          timeout: Math.max(2_000, timeoutMs),
+        })
         .catch(() => null);
       const contextDownloadPromise = waitForContextDownloadEvent(
         pageInstance.context(),
         Math.max(2_000, timeoutMs),
+        { isPageAllowed },
       );
 
       try {
@@ -912,9 +956,18 @@ const collectAssistantDownloadsByClick = async (
 
       if (!downloadResponse) {
         if (downloadRequest) {
-          const next = await saveDownloadFromUrl(pageInstance, downloadRequest.url(), {
-            imageRun,
-          });
+          let next = buildSaveResult();
+          try {
+            next = await saveDownloadFromUrl(pageInstance, downloadRequest.url(), {
+              imageRun,
+            });
+          } catch (error) {
+            console.warn(
+              "Failed to save from clicked download request:",
+              downloadRequest.url(),
+              error,
+            );
+          }
           result = mergeSaveResults(result, next);
           if ((result.savedCount ?? 0) > 0) {
             return result;
@@ -924,9 +977,18 @@ const collectAssistantDownloadsByClick = async (
       }
       const responseType = downloadResponse.headers()["content-type"] ?? "";
       if (isJsonContentType(responseType)) {
-        const next = await saveDownloadFromUrl(pageInstance, downloadResponse.url(), {
-          imageRun,
-        });
+        let next = buildSaveResult();
+        try {
+          next = await saveDownloadFromUrl(pageInstance, downloadResponse.url(), {
+            imageRun,
+          });
+        } catch (error) {
+          console.warn(
+            "Failed to save from clicked metadata response:",
+            downloadResponse.url(),
+            error,
+          );
+        }
         result = mergeSaveResults(result, next);
         if ((result.savedCount ?? 0) > 0) {
           return result;
@@ -970,7 +1032,7 @@ const collectAssistantDownloadsByClick = async (
 
 const collectAssistantDownloadsAfterCompletion = async (
   pageInstance,
-  { imageRun = null, timeoutMs = 18_000 } = {},
+  { imageRun = null, timeoutMs = 18_000, isPageAllowed = () => true } = {},
 ) => {
   const deadline = Date.now() + timeoutMs;
   const attemptedUrls = new Set();
@@ -998,6 +1060,7 @@ const collectAssistantDownloadsAfterCompletion = async (
       imageRun,
       attemptedControlKeys,
       timeoutMs: Math.max(2_500, Math.min(8_000, timeoutMs / 2)),
+      isPageAllowed,
     });
     result = mergeSaveResults(result, clicked);
     if ((result.savedCount ?? 0) > 0) {
@@ -2008,6 +2071,9 @@ const runChatGptPromptFlow = async (
       savedCount: result.savedCount ?? 0,
     });
   };
+  const isRunPage = (candidatePage) =>
+    Boolean(candidatePage) &&
+    (candidatePage === activePage || runOwnedPages.has(candidatePage));
   const collectDownloads = async () =>
     collectChatGptDownloads(activePage, {
       timeoutMs: config.imageTimeoutMs,
@@ -2177,8 +2243,10 @@ const runChatGptPromptFlow = async (
         if (!asyncSeenAt) return false;
         if (record.ts < asyncSeenAt) return false;
         if (!asyncConversationId) return true;
+        if (!record.conversationId) return true;
         return record.conversationId === asyncConversationId;
       };
+      let assistantFallbackAttempted = false;
 
       const responseListener = (response) => {
         responseQueue = responseQueue
@@ -2331,17 +2399,25 @@ const runChatGptPromptFlow = async (
           mergeResult(
             await saveDownloadRecord(activePage, lastAfterAsync, { imageRun }),
           );
-        } else if (lastValidDownload || lastDownload) {
-          const fallback = lastValidDownload ?? lastDownload;
-          console.warn(
-            "No download after async-status. Using last seen download instead.",
-          );
-          mergeResult(await saveDownloadRecord(activePage, fallback, { imageRun }));
         } else {
-          console.warn(
-            "Async-status detected, but no download found. Falling back to collector.",
-          );
-          mergeResult(await collectDownloads());
+          const fallbackAfterAsync =
+            (lastValidDownload && lastValidDownload.ts >= asyncSeenAt
+              ? lastValidDownload
+              : null) ||
+            (lastDownload && lastDownload.ts >= asyncSeenAt ? lastDownload : null);
+          if (fallbackAfterAsync) {
+            console.warn(
+              "No conversation-matched download after async-status. Using latest post-async download candidate.",
+            );
+            mergeResult(
+              await saveDownloadRecord(activePage, fallbackAfterAsync, { imageRun }),
+            );
+          } else {
+            console.warn(
+              "Async-status detected, but no post-async download found. Falling back to collector.",
+            );
+            mergeResult(await collectDownloads());
+          }
         }
         if ((result.savedCount ?? 0) === savedCountBefore) {
           console.warn(
@@ -2351,10 +2427,28 @@ const runChatGptPromptFlow = async (
         }
       } catch (error) {
         activePage.off("response", responseListener);
-        console.warn("Async-status wait failed, using collector instead.");
-        mergeResult(await collectDownloads());
+        console.warn(
+          "Async-status wait failed. Trying assistant download controls before collector.",
+        );
+        assistantFallbackAttempted = true;
+        mergeResult(
+          await collectAssistantDownloadsAfterCompletion(activePage, {
+            imageRun,
+            timeoutMs: Math.max(12_000, config.imageIdleMs + 10_000),
+            isPageAllowed: isRunPage,
+          }),
+        );
+        if ((result.savedCount ?? 0) === savedCountBefore) {
+          console.warn(
+            "Assistant download fallback found no files. Falling back to collector.",
+          );
+          mergeResult(await collectDownloads());
+        }
       }
-      if ((result.savedCount ?? 0) === savedCountBefore) {
+      if (
+        !assistantFallbackAttempted &&
+        (result.savedCount ?? 0) === savedCountBefore
+      ) {
         console.warn(
           "No direct download stream found. Looking for assistant download links.",
         );
@@ -2362,6 +2456,7 @@ const runChatGptPromptFlow = async (
           await collectAssistantDownloadsAfterCompletion(activePage, {
             imageRun,
             timeoutMs: Math.max(12_000, config.imageIdleMs + 10_000),
+            isPageAllowed: isRunPage,
           }),
         );
       }
