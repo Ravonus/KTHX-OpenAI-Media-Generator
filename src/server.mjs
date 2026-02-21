@@ -495,6 +495,14 @@ const applyExtension = (fileName, ext) => {
   return `${fileName}${ext}`;
 };
 
+const IMAGE_STREAM_PART_SEGMENT_RE = /\.part\d+(?=\.[^.]+$|$)/i;
+
+const isLikelyImageStreamPartName = (value) => {
+  if (typeof value !== "string" || !value.trim()) return false;
+  const name = basename(value.trim());
+  return IMAGE_STREAM_PART_SEGMENT_RE.test(name);
+};
+
 const ensureUniqueOutputPath = (filePath) => {
   if (!existsSync(filePath)) return filePath;
   const parentDir = dirname(filePath);
@@ -535,17 +543,109 @@ const retainLatestImageOnly = async (saveResult) => {
   const savedFiles = Array.isArray(saveResult.savedFiles)
     ? saveResult.savedFiles.filter((entry) => entry && entry.filePath)
     : [];
-  if (savedFiles.length <= 1) {
+  const streamEvents = Array.isArray(saveResult.streamEvents)
+    ? saveResult.streamEvents
+    : [];
+  const candidateByPath = new Map();
+  const pushCandidate = ({
+    filePath,
+    fileName = "",
+    byteLength = null,
+    contentType = "",
+    metadataId = null,
+  }) => {
+    if (typeof filePath !== "string" || !filePath.trim()) return;
+    const normalizedPath = filePath.trim();
+    const existing = candidateByPath.get(normalizedPath);
+    if (!existing) {
+      candidateByPath.set(normalizedPath, {
+        filePath: normalizedPath,
+        fileName:
+          typeof fileName === "string" && fileName.trim()
+            ? basename(fileName.trim())
+            : basename(normalizedPath),
+        byteLength: Number.isFinite(byteLength) ? byteLength : null,
+        contentType: typeof contentType === "string" ? contentType : "",
+        metadataId: typeof metadataId === "string" ? metadataId : null,
+      });
+      return;
+    }
+    if (!existing.fileName && fileName) {
+      existing.fileName = basename(fileName);
+    }
+    if (!Number.isFinite(existing.byteLength) && Number.isFinite(byteLength)) {
+      existing.byteLength = byteLength;
+    }
+    if (!existing.contentType && contentType) {
+      existing.contentType = contentType;
+    }
+    if (!existing.metadataId && metadataId) {
+      existing.metadataId = metadataId;
+    }
+  };
+
+  for (const file of savedFiles) {
+    pushCandidate(file);
+  }
+  for (const event of streamEvents) {
+    if (!event || typeof event !== "object") continue;
+    pushCandidate({
+      filePath: event.outputPath,
+      fileName: event.fileName,
+      byteLength: event.byteLength,
+      contentType: event.contentType,
+      metadataId: event.metadataId,
+    });
+  }
+
+  const candidates = [...candidateByPath.values()];
+  if (candidates.length === 0) {
     return saveResult;
   }
 
-  const latest = savedFiles[savedFiles.length - 1];
-  const latestPath = latest.filePath;
-  const removedPaths = new Set();
-  for (const file of savedFiles.slice(0, -1)) {
-    const path = file?.filePath;
-    if (!path || path === latestPath || removedPaths.has(path)) continue;
-    removedPaths.add(path);
+  const existingCandidates = candidates.filter((entry) =>
+    existsSync(entry.filePath),
+  );
+  const existingNonPartCandidates = existingCandidates.filter(
+    (entry) =>
+      !isLikelyImageStreamPartName(entry.fileName) &&
+      !isLikelyImageStreamPartName(entry.filePath),
+  );
+  const nonPartCandidates = candidates.filter(
+    (entry) =>
+      !isLikelyImageStreamPartName(entry.fileName) &&
+      !isLikelyImageStreamPartName(entry.filePath),
+  );
+  const selected =
+    existingNonPartCandidates[existingNonPartCandidates.length - 1] ||
+    existingCandidates[existingCandidates.length - 1] ||
+    nonPartCandidates[nonPartCandidates.length - 1] ||
+    candidates[candidates.length - 1] ||
+    null;
+  if (!selected) {
+    return saveResult;
+  }
+
+  let byteLength = Number.isFinite(selected.byteLength)
+    ? selected.byteLength
+    : 0;
+  try {
+    if (existsSync(selected.filePath)) {
+      const info = await stat(selected.filePath);
+      byteLength = info?.size ?? byteLength;
+    }
+  } catch {
+    // keep existing byteLength when stat fails
+  }
+
+  const pathsToDelete = new Set();
+  for (const candidate of candidates) {
+    if (!candidate?.filePath || candidate.filePath === selected.filePath) {
+      continue;
+    }
+    pathsToDelete.add(candidate.filePath);
+  }
+  for (const path of pathsToDelete) {
     try {
       await unlink(path);
     } catch {
@@ -554,15 +654,23 @@ const retainLatestImageOnly = async (saveResult) => {
   }
 
   const latestMetadataId =
-    latest?.metadataId ||
+    selected.metadataId ||
     (Array.isArray(saveResult.metadataIds) && saveResult.metadataIds.length > 0
       ? saveResult.metadataIds[saveResult.metadataIds.length - 1]
       : null);
   return buildSaveResult(
     1,
-    [latest],
+    [
+      {
+        filePath: selected.filePath,
+        fileName: selected.fileName || basename(selected.filePath),
+        byteLength,
+        contentType: selected.contentType || "",
+        metadataId: latestMetadataId,
+      },
+    ],
     latestMetadataId ? [latestMetadataId] : [],
-    Array.isArray(saveResult.streamEvents) ? saveResult.streamEvents : [],
+    streamEvents,
   );
 };
 
@@ -856,9 +964,17 @@ const saveDownloadFromUrl = async (
       return buildSaveResult();
     }
     const metadataId = extractFileId(downloadUrl) || initialMetadataId || null;
-    const fileName =
+    const metadataFileNameRaw =
       typeof fileInfo?.file_name === "string"
         ? basename(fileInfo.file_name)
+        : "";
+    const fileName =
+      metadataFileNameRaw &&
+      !(
+        imageRun?.generationMode === "image" &&
+        isLikelyImageStreamPartName(metadataFileNameRaw)
+      )
+        ? metadataFileNameRaw
         : null;
     return saveDownloadRecord(
       pageInstance,
@@ -1695,9 +1811,19 @@ const collectChatGptDownloads = async (
           } = await fetchDownloadWithRetry(pageInstance, downloadUrl, {
             preferCurl: imageRun?.generationMode === "file",
           });
-          const nameCandidate =
+          const metadataFileNameRaw =
             typeof fileInfo?.file_name === "string"
               ? basename(fileInfo.file_name)
+              : "";
+          const shouldUseMetadataFileName =
+            Boolean(metadataFileNameRaw) &&
+            !(
+              imageRun?.generationMode === "image" &&
+              isLikelyImageStreamPartName(metadataFileNameRaw)
+            );
+          const nameCandidate =
+            shouldUseMetadataFileName
+              ? metadataFileNameRaw
               : fetchedFileName
                 ? basename(fetchedFileName)
                 : `${imageRun?.filePrefix || "download"}-${Date.now()}`;
