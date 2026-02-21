@@ -1,8 +1,8 @@
 import http from "node:http";
-import { copyFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { basename, extname, resolve } from "node:path";
+import { basename, dirname, extname, resolve } from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline/promises";
 import { execFile } from "node:child_process";
@@ -129,6 +129,10 @@ const config = {
   storageDirFromEnv: Boolean(process.env.PW_STORAGE_DIR),
   outputDir: resolve(process.cwd(), process.env.PW_OUTPUT_DIR ?? "generations"),
   outputDirFromEnv: Boolean(process.env.PW_OUTPUT_DIR),
+  downloadsDir: resolve(
+    process.cwd(),
+    process.env.PW_DOWNLOADS_DIR ?? (process.env.PW_OUTPUT_DIR ?? "generations"),
+  ),
   headlessInitial: boolFromEnv("PW_HEADLESS", false),
   headlessAfterAuth: boolFromEnv("PW_HEADLESS_AFTER_AUTH", false),
   headless: boolFromEnv("PW_HEADLESS", false),
@@ -146,6 +150,8 @@ const config = {
   imageIdleMs: numberFromEnv("PW_IMAGE_IDLE_MS", 8_000),
   imageTimeoutMs: numberFromEnv("PW_IMAGE_TIMEOUT_MS", 90_000),
   imageMax: numberFromEnv("PW_IMAGE_MAX", 8),
+  preferCurlDownloads: boolFromEnv("PW_PREFER_CURL_DOWNLOADS", true),
+  curlTimeoutMs: numberFromEnv("PW_CURL_TIMEOUT_MS", 25_000),
   asyncPostWindowMs: numberFromEnv("PW_ASYNC_POST_WINDOW_MS", 2_500),
   acceptDownloads: boolFromEnv("PW_ACCEPT_DOWNLOADS", true),
   viewport: parseViewport(process.env.PW_VIEWPORT ?? ""),
@@ -192,6 +198,10 @@ const ensureStorageDir = async () => {
 
 const ensureOutputDir = async () => {
   await mkdir(config.outputDir, { recursive: true });
+};
+
+const ensureDownloadsDir = async () => {
+  await mkdir(config.downloadsDir, { recursive: true });
 };
 
 const ensureContextRunsDir = async () => {
@@ -485,6 +495,19 @@ const applyExtension = (fileName, ext) => {
   return `${fileName}${ext}`;
 };
 
+const ensureUniqueOutputPath = (filePath) => {
+  if (!existsSync(filePath)) return filePath;
+  const parentDir = dirname(filePath);
+  const extension = extname(filePath);
+  const baseName = basename(filePath, extension);
+  let index = 2;
+  while (true) {
+    const nextPath = resolve(parentDir, `${baseName}-${index}${extension}`);
+    if (!existsSync(nextPath)) return nextPath;
+    index += 1;
+  }
+};
+
 const buildSaveResult = (
   savedCount = 0,
   savedFiles = [],
@@ -504,6 +527,42 @@ const mergeSaveResults = (base, extra) => {
     [...(base.savedFiles ?? []), ...(extra.savedFiles ?? [])],
     [...(base.metadataIds ?? []), ...(extra.metadataIds ?? [])],
     [...(base.streamEvents ?? []), ...(extra.streamEvents ?? [])],
+  );
+};
+
+const retainLatestImageOnly = async (saveResult) => {
+  if (!saveResult) return buildSaveResult();
+  const savedFiles = Array.isArray(saveResult.savedFiles)
+    ? saveResult.savedFiles.filter((entry) => entry && entry.filePath)
+    : [];
+  if (savedFiles.length <= 1) {
+    return saveResult;
+  }
+
+  const latest = savedFiles[savedFiles.length - 1];
+  const latestPath = latest.filePath;
+  const removedPaths = new Set();
+  for (const file of savedFiles.slice(0, -1)) {
+    const path = file?.filePath;
+    if (!path || path === latestPath || removedPaths.has(path)) continue;
+    removedPaths.add(path);
+    try {
+      await unlink(path);
+    } catch {
+      // best effort cleanup
+    }
+  }
+
+  const latestMetadataId =
+    latest?.metadataId ||
+    (Array.isArray(saveResult.metadataIds) && saveResult.metadataIds.length > 0
+      ? saveResult.metadataIds[saveResult.metadataIds.length - 1]
+      : null);
+  return buildSaveResult(
+    1,
+    [latest],
+    latestMetadataId ? [latestMetadataId] : [],
+    Array.isArray(saveResult.streamEvents) ? saveResult.streamEvents : [],
   );
 };
 
@@ -555,31 +614,218 @@ const saveBufferToDisk = async (
   };
 };
 
-const fetchDownloadWithRetry = async (request, url, attempts = 4) => {
+const execFileWithOutput = (file, args, { timeoutMs = 0 } = {}) =>
+  new Promise((resolvePromise, rejectPromise) => {
+    execFile(
+      file,
+      args,
+      {
+        timeout: timeoutMs > 0 ? timeoutMs : undefined,
+        maxBuffer: 2 * 1024 * 1024,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          err.stdout = stdout;
+          err.stderr = stderr;
+          rejectPromise(err);
+          return;
+        }
+        resolvePromise({ stdout, stderr });
+      },
+    );
+  });
+
+const buildCookieHeaderForUrl = async (pageInstance, url) => {
+  try {
+    const cookies = await pageInstance.context().cookies([url]);
+    if (!Array.isArray(cookies) || cookies.length === 0) return "";
+    return cookies
+      .filter((cookie) => cookie?.name)
+      .map((cookie) => `${cookie.name}=${cookie.value ?? ""}`)
+      .join("; ");
+  } catch {
+    return "";
+  }
+};
+
+const parseHttpStatusCode = (line) => {
+  if (typeof line !== "string") return null;
+  const match = /^HTTP\/\d(?:\.\d)?\s+(\d{3})/i.exec(line.trim());
+  if (!match) return null;
+  const code = Number(match[1]);
+  return Number.isFinite(code) ? code : null;
+};
+
+const parseCurlHeaderDump = (rawValue) => {
+  if (typeof rawValue !== "string" || !rawValue.trim()) {
+    return { statusCode: null, headers: {} };
+  }
+  const lines = rawValue.split(/\r?\n/);
+  const blocks = [];
+  let current = null;
+  for (const line of lines) {
+    if (/^HTTP\/\d/i.test(line)) {
+      if (current) {
+        blocks.push(current);
+      }
+      current = {
+        statusLine: line.trim(),
+        headers: {},
+      };
+      continue;
+    }
+    if (!current) continue;
+    const separatorIndex = line.indexOf(":");
+    if (separatorIndex <= 0) continue;
+    const name = line.slice(0, separatorIndex).trim().toLowerCase();
+    const value = line.slice(separatorIndex + 1).trim();
+    if (!name) continue;
+    current.headers[name] = value;
+  }
+  if (current) {
+    blocks.push(current);
+  }
+  if (blocks.length === 0) {
+    return { statusCode: null, headers: {} };
+  }
+  let selected = blocks[blocks.length - 1];
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const candidate = blocks[index];
+    const statusCode = parseHttpStatusCode(candidate.statusLine);
+    if (statusCode && statusCode !== 100) {
+      selected = candidate;
+      break;
+    }
+  }
+  return {
+    statusCode: parseHttpStatusCode(selected.statusLine),
+    headers: selected.headers,
+  };
+};
+
+let curlUnavailableLogged = false;
+
+const fetchDownloadWithCurl = async (
+  pageInstance,
+  url,
+  { timeoutMs = 25_000 } = {},
+) => {
+  const runId = randomUUID();
+  const headerPath = resolve(config.outputDir, `.curl-${runId}.headers`);
+  const bodyPath = resolve(config.outputDir, `.curl-${runId}.body`);
+  const args = [
+    "-sS",
+    "-L",
+    "--fail",
+    "--retry",
+    "2",
+    "--retry-delay",
+    "1",
+    "--retry-all-errors",
+    "--connect-timeout",
+    "10",
+    "--max-time",
+    String(Math.max(5, Math.ceil(timeoutMs / 1000))),
+    "-H",
+    "Accept: */*",
+  ];
+  const referer = pageInstance.url();
+  if (referer) {
+    args.push("-e", referer);
+  }
+  const cookieHeader = await buildCookieHeaderForUrl(pageInstance, url);
+  if (cookieHeader) {
+    args.push("-H", `Cookie: ${cookieHeader}`);
+  }
+  if (config.userAgent) {
+    args.push("-A", config.userAgent);
+  }
+  args.push("-D", headerPath, "-o", bodyPath, url);
+  try {
+    await execFileWithOutput("curl", args, { timeoutMs: timeoutMs + 5_000 });
+    const [headerDump, buffer] = await Promise.all([
+      readFile(headerPath, "utf8").catch(() => ""),
+      readFile(bodyPath),
+    ]);
+    const parsed = parseCurlHeaderDump(headerDump);
+    const contentType = parsed.headers["content-type"] ?? "";
+    const disposition = parsed.headers["content-disposition"] ?? "";
+    return {
+      buffer,
+      contentType,
+      status: parsed.statusCode ?? 200,
+      fileName: parseContentDispositionFileName(disposition),
+    };
+  } finally {
+    await Promise.all([
+      unlink(headerPath).catch(() => undefined),
+      unlink(bodyPath).catch(() => undefined),
+    ]);
+  }
+};
+
+const fetchDownloadWithRetry = async (
+  pageInstance,
+  url,
+  { attempts = 4, preferCurl = false } = {},
+) => {
+  if (preferCurl && config.preferCurlDownloads) {
+    try {
+      return await fetchDownloadWithCurl(pageInstance, url, {
+        timeoutMs: config.curlTimeoutMs,
+      });
+    } catch (error) {
+      const code = error && typeof error === "object" ? error.code : "";
+      if (code === "ENOENT") {
+        if (!curlUnavailableLogged) {
+          curlUnavailableLogged = true;
+          console.warn(
+            "curl not found in PATH. Falling back to Playwright downloads.",
+          );
+        }
+      } else {
+        console.warn(
+          "curl download failed. Falling back to Playwright request download.",
+          error?.message ?? error,
+        );
+      }
+    }
+  }
+
   let lastStatus = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const response = await request.get(url);
-    lastStatus = response.status();
-    const contentType = response.headers()["content-type"] ?? "";
-    if (response.ok() && !isJsonContentType(contentType)) {
-      const buffer = await response.body();
-      const disposition = response.headers()["content-disposition"] ?? "";
-      return {
-        buffer,
-        contentType,
-        status: response.status(),
-        fileName: parseContentDispositionFileName(disposition),
-      };
-    }
-    const preview = await response.text();
-    console.warn(
-      `Download attempt ${attempt}/${attempts} returned ${response.status()} (${contentType}).`,
-    );
-    if (preview) {
-      console.warn("Download response preview:", preview.slice(0, 200));
+    try {
+      const response = await pageInstance.request.get(url, {
+        timeout: config.curlTimeoutMs,
+      });
+      lastStatus = response.status();
+      const contentType = response.headers()["content-type"] ?? "";
+      if (response.ok() && !isJsonContentType(contentType)) {
+        const buffer = await response.body();
+        const disposition = response.headers()["content-disposition"] ?? "";
+        return {
+          buffer,
+          contentType,
+          status: response.status(),
+          fileName: parseContentDispositionFileName(disposition),
+        };
+      }
+      const preview = await response.text();
+      console.warn(
+        `Download attempt ${attempt}/${attempts} returned ${response.status()} (${contentType}).`,
+      );
+      if (preview) {
+        console.warn("Download response preview:", preview.slice(0, 200));
+      }
+    } catch (error) {
+      console.warn(
+        `Download attempt ${attempt}/${attempts} failed for ${url}:`,
+        error?.message ?? error,
+      );
     }
     if (attempt < attempts) {
-      await sleep(1000 * attempt);
+      await sleep(350 * attempt);
     }
   }
   throw new Error(
@@ -592,7 +838,9 @@ const saveDownloadFromUrl = async (
   url,
   { imageRun = null } = {},
 ) => {
-  const response = await pageInstance.request.get(url);
+  const response = await pageInstance.request.get(url, {
+    timeout: config.curlTimeoutMs,
+  });
   const contentType = response.headers()["content-type"] ?? "";
   const initialMetadataId = extractFileId(url);
   if (isJsonContentType(contentType)) {
@@ -655,10 +903,13 @@ const isLikelyAssistantDownloadUrl = (value) => {
     const parsed = new URL(value);
     if (!/^https?:$/i.test(parsed.protocol)) return false;
     const host = parsed.hostname.toLowerCase();
+    const isEstuaryContentPath =
+      parsed.pathname === "/backend-api/estuary/content" ||
+      parsed.pathname.startsWith("/backend-api/estuary/content/");
     if (/chatgpt\.com$|chat\.openai\.com$/i.test(host)) {
       return (
         parsed.pathname.includes("/files/") ||
-        parsed.pathname.startsWith("/backend-api/estuary/content/")
+        isEstuaryContentPath
       );
     }
     if (
@@ -676,10 +927,13 @@ const isLikelyDownloadResponseUrl = (value) => {
   try {
     const parsed = new URL(value);
     const host = parsed.hostname.toLowerCase();
+    const isEstuaryContentPath =
+      parsed.pathname === "/backend-api/estuary/content" ||
+      parsed.pathname.startsWith("/backend-api/estuary/content/");
     if (/chatgpt\.com$|chat\.openai\.com$/i.test(host)) {
       return (
         parsed.pathname.startsWith("/backend-api/files/download/") ||
-        parsed.pathname.startsWith("/backend-api/estuary/content/") ||
+        isEstuaryContentPath ||
         parsed.pathname.includes("/files/")
       );
     }
@@ -716,15 +970,95 @@ const resolvePageFromResponse = (response) => {
   }
 };
 
-const savePlaywrightDownload = async (download, { imageRun = null } = {}) => {
+const savePlaywrightDownload = async (
+  download,
+  { pageInstance = null, imageRun = null } = {},
+) => {
   if (!download) return buildSaveResult();
   const suggestedName =
     typeof download.suggestedFilename === "function"
       ? download.suggestedFilename()
       : "";
+  const sourceUrl =
+    typeof download.url === "function" ? download.url() : "";
+  const metadataId = sourceUrl ? extractFileId(sourceUrl) : null;
+  console.log(
+    "Playwright download event captured:",
+    sourceUrl || "(no source URL)",
+  );
+
+  if (pageInstance && /^https?:\/\//i.test(sourceUrl)) {
+    try {
+      const next = await saveDownloadFromUrl(pageInstance, sourceUrl, {
+        imageRun,
+      });
+      if ((next.savedCount ?? 0) > 0) {
+        return next;
+      }
+    } catch (error) {
+      console.warn(
+        "Failed to save Playwright download via source URL:",
+        sourceUrl,
+        error,
+      );
+    }
+  }
+
+  if (typeof download.saveAs === "function") {
+    try {
+      await ensureOutputDir();
+      const normalizedSuggestedName =
+        typeof suggestedName === "string" && suggestedName.trim()
+          ? basename(suggestedName.trim())
+          : "";
+      const suggestedExt = extname(normalizedSuggestedName);
+      const baseName =
+        imageRun?.randomizeFileNames === true
+          ? nextRandomBaseName(imageRun)
+          : normalizedSuggestedName ||
+            `${imageRun?.filePrefix || "download"}-${Date.now()}`;
+      let safeName = sanitizeFileName(baseName);
+      if (!extname(safeName) && suggestedExt) {
+        safeName = applyExtension(safeName, suggestedExt);
+      }
+      const targetPath = ensureUniqueOutputPath(
+        resolve(config.outputDir, safeName),
+      );
+      await Promise.race([
+        download.saveAs(targetPath),
+        sleep(Math.max(10_000, config.curlTimeoutMs + 5_000)).then(() => {
+          throw new Error("Timed out waiting for download.saveAs");
+        }),
+      ]);
+      const info = await stat(targetPath);
+      return buildSaveResult(
+        1,
+        [
+          {
+            filePath: targetPath,
+            fileName: basename(targetPath),
+            byteLength: info?.size ?? 0,
+            contentType: "",
+            metadataId,
+          },
+        ],
+        metadataId ? [metadataId] : [],
+      );
+    } catch (error) {
+      console.warn(
+        "download.saveAs failed. Falling back to path/read-stream download capture.",
+        error,
+      );
+    }
+  }
+
   let buffer = null;
   try {
-    const savedPath = await download.path();
+    const pathPromise = download.path().catch(() => null);
+    const savedPath = await Promise.race([
+      pathPromise,
+      sleep(6_000).then(() => null),
+    ]);
     if (savedPath) {
       buffer = await readFile(savedPath);
     }
@@ -748,9 +1082,6 @@ const savePlaywrightDownload = async (download, { imageRun = null } = {}) => {
   if (!buffer || buffer.byteLength === 0) {
     return buildSaveResult();
   }
-  const sourceUrl =
-    typeof download.url === "function" ? download.url() : "";
-  const metadataId = sourceUrl ? extractFileId(sourceUrl) : null;
   const saved = await saveBufferToDisk(buffer, {
     fileName:
       (typeof suggestedName === "string" && suggestedName.trim()
@@ -766,7 +1097,10 @@ const savePlaywrightDownload = async (download, { imageRun = null } = {}) => {
 const waitForContextDownloadEvent = async (
   ctx,
   timeoutMs,
-  { isPageAllowed = () => true } = {},
+  {
+    isPageAllowed = () => true,
+    shouldAcceptUnknownPageEvent = () => false,
+  } = {},
 ) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -782,7 +1116,13 @@ const waitForContextDownloadEvent = async (
     if (!download) return null;
     const sourcePage =
       typeof download.page === "function" ? download.page() : null;
-    if (!sourcePage || isPageAllowed(sourcePage)) {
+    if (!sourcePage) {
+      if (shouldAcceptUnknownPageEvent()) {
+        return download;
+      }
+      continue;
+    }
+    if (isPageAllowed(sourcePage) || shouldAcceptUnknownPageEvent()) {
       return download;
     }
   }
@@ -834,6 +1174,7 @@ const collectAssistantDownloadsByClick = async (
     attemptedControlKeys = new Set(),
     timeoutMs = 8_000,
     isPageAllowed = () => true,
+    closeTransientPages = async () => undefined,
   } = {},
 ) => {
   const shouldAcceptUnknownPageEvent = () => {
@@ -845,6 +1186,13 @@ const collectAssistantDownloadsByClick = async (
       return allowedPages.length <= 1;
     } catch {
       return false;
+    }
+  };
+  const closeTransientPagesSafe = async () => {
+    try {
+      await closeTransientPages();
+    } catch {
+      // best effort popup cleanup
     }
   };
   let result = buildSaveResult();
@@ -882,6 +1230,7 @@ const collectAssistantDownloadsByClick = async (
             });
             result = mergeSaveResults(result, next);
             if ((result.savedCount ?? 0) > 0) {
+              await closeTransientPagesSafe();
               return result;
             }
           }
@@ -897,7 +1246,8 @@ const collectAssistantDownloadsByClick = async (
             if (!isLikelyDownloadResponseUrl(response.url())) return false;
             const eventPage = resolvePageFromResponse(response);
             if (!eventPage) return shouldAcceptUnknownPageEvent();
-            return isPageAllowed(eventPage);
+            if (isPageAllowed(eventPage)) return true;
+            return shouldAcceptUnknownPageEvent();
           },
           timeout: Math.max(2_000, timeoutMs),
         })
@@ -909,7 +1259,8 @@ const collectAssistantDownloadsByClick = async (
             if (!isLikelyDownloadResponseUrl(request.url())) return false;
             const eventPage = resolvePageFromRequest(request);
             if (!eventPage) return shouldAcceptUnknownPageEvent();
-            return isPageAllowed(eventPage);
+            if (isPageAllowed(eventPage)) return true;
+            return shouldAcceptUnknownPageEvent();
           },
           timeout: Math.max(2_000, timeoutMs),
         })
@@ -917,7 +1268,7 @@ const collectAssistantDownloadsByClick = async (
       const contextDownloadPromise = waitForContextDownloadEvent(
         pageInstance.context(),
         Math.max(2_000, timeoutMs),
-        { isPageAllowed },
+        { isPageAllowed, shouldAcceptUnknownPageEvent },
       );
 
       try {
@@ -936,35 +1287,61 @@ const collectAssistantDownloadsByClick = async (
             text || "(no text)",
             error,
           );
+          await closeTransientPagesSafe();
           continue;
         }
       }
 
-      const [downloadResponse, downloadRequest, downloadEvent] = await Promise.all([
-        responsePromise,
-        requestPromise,
-        contextDownloadPromise,
-      ]);
+      try {
+        const [downloadResponse, downloadRequest, downloadEvent] = await Promise.all([
+          responsePromise,
+          requestPromise,
+          contextDownloadPromise,
+        ]);
 
-      if (downloadEvent) {
-        const next = await savePlaywrightDownload(downloadEvent, { imageRun });
-        result = mergeSaveResults(result, next);
-        if ((result.savedCount ?? 0) > 0) {
-          return result;
+        if (downloadEvent) {
+          const next = await savePlaywrightDownload(downloadEvent, {
+            pageInstance,
+            imageRun,
+          });
+          result = mergeSaveResults(result, next);
+          if ((result.savedCount ?? 0) > 0) {
+            return result;
+          }
         }
-      }
 
-      if (!downloadResponse) {
-        if (downloadRequest) {
+        if (!downloadResponse) {
+          if (downloadRequest) {
+            let next = buildSaveResult();
+            try {
+              next = await saveDownloadFromUrl(pageInstance, downloadRequest.url(), {
+                imageRun,
+              });
+            } catch (error) {
+              console.warn(
+                "Failed to save from clicked download request:",
+                downloadRequest.url(),
+                error,
+              );
+            }
+            result = mergeSaveResults(result, next);
+            if ((result.savedCount ?? 0) > 0) {
+              return result;
+            }
+          }
+          continue;
+        }
+        const responseType = downloadResponse.headers()["content-type"] ?? "";
+        if (isJsonContentType(responseType)) {
           let next = buildSaveResult();
           try {
-            next = await saveDownloadFromUrl(pageInstance, downloadRequest.url(), {
+            next = await saveDownloadFromUrl(pageInstance, downloadResponse.url(), {
               imageRun,
             });
           } catch (error) {
             console.warn(
-              "Failed to save from clicked download request:",
-              downloadRequest.url(),
+              "Failed to save from clicked metadata response:",
+              downloadResponse.url(),
               error,
             );
           }
@@ -972,19 +1349,30 @@ const collectAssistantDownloadsByClick = async (
           if ((result.savedCount ?? 0) > 0) {
             return result;
           }
+          continue;
         }
-        continue;
-      }
-      const responseType = downloadResponse.headers()["content-type"] ?? "";
-      if (isJsonContentType(responseType)) {
+        const metadataId = extractFileId(downloadResponse.url()) || null;
+        const contentDisposition =
+          downloadResponse.headers()["content-disposition"] ?? "";
+        const fileNameHint =
+          parseContentDispositionFileName(contentDisposition) ||
+          (metadataId
+            ? `${imageRun?.filePrefix || "download"}-${metadataId}`
+            : `${imageRun?.filePrefix || "download"}-${Date.now()}`);
         let next = buildSaveResult();
         try {
-          next = await saveDownloadFromUrl(pageInstance, downloadResponse.url(), {
-            imageRun,
-          });
+          next = await saveDownloadRecord(
+            pageInstance,
+            {
+              downloadUrl: downloadResponse.url(),
+              fileName: fileNameHint,
+              metadataId,
+            },
+            { imageRun },
+          );
         } catch (error) {
           console.warn(
-            "Failed to save from clicked metadata response:",
+            "Failed to save from clicked download response:",
             downloadResponse.url(),
             error,
           );
@@ -993,50 +1381,34 @@ const collectAssistantDownloadsByClick = async (
         if ((result.savedCount ?? 0) > 0) {
           return result;
         }
-        continue;
-      }
-      const metadataId = extractFileId(downloadResponse.url()) || null;
-      const contentDisposition =
-        downloadResponse.headers()["content-disposition"] ?? "";
-      const fileNameHint =
-        parseContentDispositionFileName(contentDisposition) ||
-        (metadataId
-          ? `${imageRun?.filePrefix || "download"}-${metadataId}`
-          : `${imageRun?.filePrefix || "download"}-${Date.now()}`);
-      let next = buildSaveResult();
-      try {
-        next = await saveDownloadRecord(
-          pageInstance,
-          {
-            downloadUrl: downloadResponse.url(),
-            fileName: fileNameHint,
-            metadataId,
-          },
-          { imageRun },
-        );
-      } catch (error) {
-        console.warn(
-          "Failed to save from clicked download response:",
-          downloadResponse.url(),
-          error,
-        );
-      }
-      result = mergeSaveResults(result, next);
-      if ((result.savedCount ?? 0) > 0) {
-        return result;
+      } finally {
+        await closeTransientPagesSafe();
       }
     }
   }
+  await closeTransientPagesSafe();
   return result;
 };
 
 const collectAssistantDownloadsAfterCompletion = async (
   pageInstance,
-  { imageRun = null, timeoutMs = 18_000, isPageAllowed = () => true } = {},
+  {
+    imageRun = null,
+    timeoutMs = 18_000,
+    isPageAllowed = () => true,
+    closeTransientPages = async () => undefined,
+  } = {},
 ) => {
   const deadline = Date.now() + timeoutMs;
   const attemptedUrls = new Set();
   const attemptedControlKeys = new Set();
+  const closeTransientPagesSafe = async () => {
+    try {
+      await closeTransientPages();
+    } catch {
+      // best effort popup cleanup
+    }
+  };
   let result = buildSaveResult();
   while (Date.now() < deadline) {
     const candidates = await extractLatestAssistantDownloadUrls(pageInstance);
@@ -1061,13 +1433,17 @@ const collectAssistantDownloadsAfterCompletion = async (
       attemptedControlKeys,
       timeoutMs: Math.max(2_500, Math.min(8_000, timeoutMs / 2)),
       isPageAllowed,
+      closeTransientPages,
     });
     result = mergeSaveResults(result, clicked);
     if ((result.savedCount ?? 0) > 0) {
+      await closeTransientPagesSafe();
       return result;
     }
+    await closeTransientPagesSafe();
     await sleep(700);
   }
+  await closeTransientPagesSafe();
   return result;
 };
 
@@ -1089,14 +1465,14 @@ const saveDownloadRecord = async (pageInstance, record, { imageRun = null } = {}
     return buildSaveResult(1, [saved], metadataId ? [metadataId] : []);
   }
   if (record.downloadUrl) {
+    const preferCurl = imageRun?.generationMode === "file";
     const {
       buffer,
       contentType,
       fileName: fetchedFileName,
-    } = await fetchDownloadWithRetry(
-      pageInstance.request,
-      record.downloadUrl,
-    );
+    } = await fetchDownloadWithRetry(pageInstance, record.downloadUrl, {
+      preferCurl,
+    });
     const saved = await saveBufferToDisk(buffer, {
       fileName:
         record.fileName ||
@@ -1132,6 +1508,69 @@ const extractConversationId = (url) => {
     }
   }
   return responseUrl.searchParams.get("conversation_id");
+};
+
+const parseConvoStreamCompletedEvent = (request) => {
+  if (!request || typeof request.method !== "function") return null;
+  if (request.method() !== "POST") return null;
+  let requestUrl;
+  try {
+    requestUrl = new URL(request.url());
+  } catch {
+    return null;
+  }
+  if (!/chatgpt\.com$|chat\.openai\.com$/i.test(requestUrl.hostname)) {
+    return null;
+  }
+  if (requestUrl.pathname !== "/ces/v1/t") return null;
+  const body =
+    typeof request.postData === "function" ? request.postData() : "";
+  if (!body) return null;
+  let payload = null;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  const eventName =
+    payload && typeof payload.event === "string" ? payload.event : "";
+  if (eventName !== "ChatGPT Convo Stream: Stream Completed") {
+    return null;
+  }
+  const properties =
+    payload &&
+    payload.properties &&
+    typeof payload.properties === "object" &&
+    !Array.isArray(payload.properties)
+      ? payload.properties
+      : {};
+  return {
+    event: eventName,
+    timestamp:
+      payload && typeof payload.timestamp === "string"
+        ? payload.timestamp
+        : null,
+    conversationId:
+      typeof properties.conversation_id === "string"
+        ? properties.conversation_id
+        : null,
+    turnTraceId:
+      typeof properties.turn_trace_id === "string"
+        ? properties.turn_trace_id
+        : null,
+    result: typeof properties.result === "string" ? properties.result : null,
+  };
+};
+
+const waitForConvoStreamCompletedEvent = async (
+  pageInstance,
+  { timeoutMs = config.imageTimeoutMs } = {},
+) => {
+  const request = await pageInstance.waitForRequest(
+    (candidateRequest) => Boolean(parseConvoStreamCompletedEvent(candidateRequest)),
+    { timeout: timeoutMs },
+  );
+  return parseConvoStreamCompletedEvent(request);
 };
 
 const collectChatGptDownloads = async (
@@ -1253,10 +1692,9 @@ const collectChatGptDownloads = async (
             buffer,
             contentType: downloadType,
             fileName: fetchedFileName,
-          } = await fetchDownloadWithRetry(
-            pageInstance.request,
-            downloadUrl,
-          );
+          } = await fetchDownloadWithRetry(pageInstance, downloadUrl, {
+            preferCurl: imageRun?.generationMode === "file",
+          });
           const nameCandidate =
             typeof fileInfo?.file_name === "string"
               ? basename(fileInfo.file_name)
@@ -1383,10 +1821,9 @@ const collectChatGptDownloads = async (
           buffer,
           contentType: downloadType,
           fileName: fetchedFileName,
-        } = await fetchDownloadWithRetry(
-          pageInstance.request,
-          downloadUrl,
-        );
+        } = await fetchDownloadWithRetry(pageInstance, downloadUrl, {
+          preferCurl: imageRun?.generationMode === "file",
+        });
         const nameHint = fetchedFileName
           ? basename(fetchedFileName)
           : `${imageRun?.filePrefix || "download"}-${item}`;
@@ -1429,14 +1866,12 @@ const collectChatGptDownloads = async (
 
   await queue;
   if (savedFiles.length > 0) {
-    const best = savedFiles.reduce((current, next) =>
-      next.byteLength > current.byteLength ? next : current,
-    );
-    const latestExt = extensionFromContentType(best.contentType);
+    const latestSaved = savedFiles[savedFiles.length - 1];
+    const latestExt = extensionFromContentType(latestSaved.contentType);
     const latestName = applyExtension("latest", latestExt);
     const latestPath = resolve(config.outputDir, latestName);
-    if (best.filePath !== latestPath) {
-      await copyFile(best.filePath, latestPath);
+    if (latestSaved.filePath !== latestPath) {
+      await copyFile(latestSaved.filePath, latestPath);
       console.log("Saved latest file:", latestPath);
     }
   }
@@ -1458,6 +1893,8 @@ const ensureContext = async () => {
   if (!contextStarting) {
     contextStarting = (async () => {
       await ensureStorageDir();
+      await ensureOutputDir();
+      await ensureDownloadsDir();
       const browserType = browsers[config.browser];
       if (!browserType) {
         throw new Error(
@@ -1481,6 +1918,7 @@ const ensureContext = async () => {
       const launchOptions = {
         headless: config.headless,
         acceptDownloads: config.acceptDownloads,
+        downloadsPath: config.downloadsDir,
         viewport: config.viewport ?? undefined,
         userAgent: config.userAgent || undefined,
         locale: config.locale || undefined,
@@ -2074,11 +2512,24 @@ const runChatGptPromptFlow = async (
   const isRunPage = (candidatePage) =>
     Boolean(candidatePage) &&
     (candidatePage === activePage || runOwnedPages.has(candidatePage));
+  const closeRunOwnedPages = async () => {
+    for (const candidatePage of [...runOwnedPages]) {
+      runOwnedPages.delete(candidatePage);
+      if (!candidatePage || candidatePage === activePage) continue;
+      if (candidatePage.isClosed()) continue;
+      try {
+        await candidatePage.close();
+      } catch {
+        // best effort cleanup of popup/download tabs
+      }
+    }
+  };
   const collectDownloads = async () =>
     collectChatGptDownloads(activePage, {
       timeoutMs: config.imageTimeoutMs,
       idleMs: config.imageIdleMs,
-      maxFiles: config.imageMax,
+      maxFiles:
+        generationMode === "image" ? Number.MAX_SAFE_INTEGER : config.imageMax,
       imageRun,
       onStreamEvent: (streamEvent) => {
         emitActivity({
@@ -2182,6 +2633,12 @@ const runChatGptPromptFlow = async (
 
     const submitPromptAndCollect = async (attemptNumber) => {
       const savedCountBefore = result.savedCount ?? 0;
+      const streamCompletedPromise =
+        generationMode === "file"
+          ? waitForConvoStreamCompletedEvent(activePage, {
+              timeoutMs: config.imageTimeoutMs,
+            })
+          : null;
       try {
         await activePage.keyboard.insertText(prompt);
       } catch {
@@ -2220,245 +2677,59 @@ const runChatGptPromptFlow = async (
           return;
         }
         console.warn(
-          "Stream capture enabled, but no streamed files were captured. Falling back to async-status/download flow.",
+          "Stream capture enabled, but no streamed files were captured. Falling back to completion/download flow.",
         );
       }
 
-      let responseQueue = Promise.resolve();
-      let lastDownload = {
-        url: null,
-        downloadUrl: null,
-        fileName: null,
-        contentType: null,
-        buffer: null,
-        metadataId: null,
-        conversationId: null,
-        ts: 0,
-      };
-      let lastValidDownload = null;
-      let lastAfterAsync = null;
-      let asyncSeenAt = 0;
-      let asyncConversationId = null;
-      const isAfterAsync = (record) => {
-        if (!asyncSeenAt) return false;
-        if (record.ts < asyncSeenAt) return false;
-        if (!asyncConversationId) return true;
-        if (!record.conversationId) return true;
-        return record.conversationId === asyncConversationId;
-      };
-      let assistantFallbackAttempted = false;
+      if (generationMode === "image") {
+        mergeResult(await collectDownloads());
+        return;
+      }
 
-      const responseListener = (response) => {
-        responseQueue = responseQueue
-          .catch(() => undefined)
-          .then(async () => {
-            const responseUrl = new URL(response.url());
-            if (responseUrl.hostname !== "chatgpt.com") return;
-            if (
-              !responseUrl.pathname.startsWith("/backend-api/files/download/")
-            ) {
-              return;
-            }
-            const conversationId = extractConversationId(response.url());
-            const responseMetadataId = extractFileId(response.url());
-            let record = {
-              url: response.url(),
-              downloadUrl: null,
-              fileName: null,
-              contentType: null,
-              buffer: null,
-              metadataId: responseMetadataId,
-              conversationId,
-              ts: Date.now(),
-            };
-            lastDownload = record;
-            console.log("Last download candidate:", lastDownload.url);
-            if (record.metadataId) {
-              emitActivity({
-                type: "download_candidate",
-                metadataId: record.metadataId,
-              });
-            }
-            const contentType = response.headers()["content-type"] ?? "";
-            if (isJsonContentType(contentType)) {
-              try {
-                const fileInfo = await response.json();
-                console.log("Received file download metadata:", fileInfo);
-                if (fileInfo?.detail?.message) {
-                  console.warn(
-                    "Download metadata error:",
-                    fileInfo.detail.message,
-                  );
-                  return;
-                }
-                if (typeof fileInfo?.download_url === "string") {
-                  record = {
-                    ...record,
-                    downloadUrl: fileInfo.download_url,
-                    metadataId:
-                      extractFileId(fileInfo.download_url) || record.metadataId,
-                  };
-                }
-                if (typeof fileInfo?.file_name === "string") {
-                  record = {
-                    ...record,
-                    fileName: basename(fileInfo.file_name),
-                  };
-                }
-                lastDownload = record;
-                if (record.downloadUrl) {
-                  lastValidDownload = record;
-                }
-                if (isAfterAsync(record)) {
-                  lastAfterAsync = record;
-                }
-                if (record.metadataId) {
-                  emitActivity({
-                    type: "metadata_detected",
-                    metadataId: record.metadataId,
-                    message: "Metadata update received",
-                    important: true,
-                  });
-                }
-              } catch (error) {
-                console.warn("Failed to parse download metadata:", error);
-              }
-              return;
-            }
-            if (!isJsonContentType(contentType)) {
-              const contentDisposition =
-                response.headers()["content-disposition"] ?? "";
-              const fileNameHint = parseContentDispositionFileName(
-                contentDisposition,
-              );
-              record = {
-                ...record,
-                downloadUrl: response.url(),
-                contentType,
-                fileName: fileNameHint
-                  ? basename(fileNameHint)
-                  : `${imageRun?.filePrefix || "download"}-${Date.now()}`,
-              };
-              lastDownload = record;
-              lastValidDownload = record;
-              if (isAfterAsync(record)) {
-                lastAfterAsync = record;
-              }
-            }
-          });
-      };
-
-      activePage.on("response", responseListener);
-
-      try {
-        await activePage.waitForRequest(
-          (request) => {
-            if (request.method() !== "POST") return false;
-            const requestUrl = new URL(request.url());
-            if (requestUrl.hostname !== "chatgpt.com") return false;
-            if (
-              !requestUrl.pathname.startsWith("/backend-api/conversation/")
-            ) {
-              return false;
-            }
-            if (!requestUrl.pathname.endsWith("/async-status")) {
-              return false;
-            }
-            asyncConversationId = extractConversationId(request.url());
-            asyncSeenAt = Date.now();
-            return true;
-          },
-          { timeout: config.imageTimeoutMs },
-        );
-
-        if (asyncConversationId) {
-          console.log("Async-status conversation:", asyncConversationId);
-          emitActivity({
-            type: "async_status_detected",
-            message: `Async status for conversation ${asyncConversationId}`,
-            important: true,
-          });
-        }
-
-        const waitForAfterAsync = async () => {
-          const deadline = Date.now() + config.asyncPostWindowMs;
-          while (!lastAfterAsync && Date.now() < deadline) {
-            await responseQueue;
-            await sleep(100);
+      let streamCompletedEvent = null;
+      if (streamCompletedPromise) {
+        try {
+          streamCompletedEvent = await streamCompletedPromise;
+          if (streamCompletedEvent) {
+            emitActivity({
+              type: "stream_completed_detected",
+              message:
+                streamCompletedEvent.result &&
+                streamCompletedEvent.result.toLowerCase() !== "success"
+                  ? `Stream completed (${streamCompletedEvent.result})`
+                  : "Stream completed",
+              conversationId: streamCompletedEvent.conversationId || undefined,
+              turnTraceId: streamCompletedEvent.turnTraceId || undefined,
+              important: true,
+            });
           }
-        };
-
-        await waitForAfterAsync();
-        activePage.off("response", responseListener);
-
-        if (lastAfterAsync) {
-          console.log(
-            "Async-status detected. Last file after async:",
-            lastAfterAsync.downloadUrl ?? lastAfterAsync.url,
+        } catch (error) {
+          console.warn(
+            "Timed out waiting for stream completion event; proceeding with assistant download scan.",
+            error,
           );
-          mergeResult(
-            await saveDownloadRecord(activePage, lastAfterAsync, { imageRun }),
+        }
+      }
+
+      mergeResult(
+        await collectAssistantDownloadsAfterCompletion(activePage, {
+          imageRun,
+          timeoutMs: Math.max(12_000, config.imageIdleMs + 10_000),
+          isPageAllowed: isRunPage,
+          closeTransientPages: closeRunOwnedPages,
+        }),
+      );
+      if ((result.savedCount ?? 0) === savedCountBefore) {
+        if (streamCompletedEvent) {
+          console.warn(
+            "No file captured from assistant download controls after stream completion. Falling back to collector.",
           );
         } else {
-          const fallbackAfterAsync =
-            (lastValidDownload && lastValidDownload.ts >= asyncSeenAt
-              ? lastValidDownload
-              : null) ||
-            (lastDownload && lastDownload.ts >= asyncSeenAt ? lastDownload : null);
-          if (fallbackAfterAsync) {
-            console.warn(
-              "No conversation-matched download after async-status. Using latest post-async download candidate.",
-            );
-            mergeResult(
-              await saveDownloadRecord(activePage, fallbackAfterAsync, { imageRun }),
-            );
-          } else {
-            console.warn(
-              "Async-status detected, but no post-async download found. Falling back to collector.",
-            );
-            mergeResult(await collectDownloads());
-          }
-        }
-        if ((result.savedCount ?? 0) === savedCountBefore) {
           console.warn(
-            "Async-status flow did not save any files. Falling back to collector.",
+            "Stream completion event was not observed. Falling back to collector.",
           );
-          mergeResult(await collectDownloads());
         }
-      } catch (error) {
-        activePage.off("response", responseListener);
-        console.warn(
-          "Async-status wait failed. Trying assistant download controls before collector.",
-        );
-        assistantFallbackAttempted = true;
-        mergeResult(
-          await collectAssistantDownloadsAfterCompletion(activePage, {
-            imageRun,
-            timeoutMs: Math.max(12_000, config.imageIdleMs + 10_000),
-            isPageAllowed: isRunPage,
-          }),
-        );
-        if ((result.savedCount ?? 0) === savedCountBefore) {
-          console.warn(
-            "Assistant download fallback found no files. Falling back to collector.",
-          );
-          mergeResult(await collectDownloads());
-        }
-      }
-      if (
-        !assistantFallbackAttempted &&
-        (result.savedCount ?? 0) === savedCountBefore
-      ) {
-        console.warn(
-          "No direct download stream found. Looking for assistant download links.",
-        );
-        mergeResult(
-          await collectAssistantDownloadsAfterCompletion(activePage, {
-            imageRun,
-            timeoutMs: Math.max(12_000, config.imageIdleMs + 10_000),
-            isPageAllowed: isRunPage,
-          }),
-        );
+        mergeResult(await collectDownloads());
       }
     };
 
@@ -2473,6 +2744,14 @@ const runChatGptPromptFlow = async (
       console.warn("Assistant reported generation error. Retrying once...");
       assistantErrorMessageSeen = null;
       await submitPromptAndCollect(2);
+    }
+
+    if (
+      generationMode === "image" &&
+      Array.isArray(result.savedFiles) &&
+      result.savedFiles.length > 1
+    ) {
+      result = await retainLatestImageOnly(result);
     }
 
     console.log(
@@ -2525,16 +2804,8 @@ const runChatGptPromptFlow = async (
       clearInterval(assistantPollTimer);
       assistantPollTimer = null;
     }
+    await closeRunOwnedPages();
     if (shouldClosePage) {
-      for (const candidatePage of runOwnedPages) {
-        if (!candidatePage || candidatePage === activePage) continue;
-        if (candidatePage.isClosed()) continue;
-        try {
-          await candidatePage.close();
-        } catch {
-          // best effort cleanup of download popups/tabs
-        }
-      }
       if (!activePage.isClosed()) {
         await activePage.close();
       }
