@@ -71,6 +71,7 @@ generateImage --dir ./path/path2/path3 \"Generate an image of a dune worm\"
 You can force behavior with `--mode image|file|auto` on either CLI command.
 Use `--stream` to enable stream-first network capture before fallback download handling.
 This is opportunistic: images usually stream cleanly, while some file types only expose a clickable download link later, so fallback handling still runs.
+For image mode, each streamed frame is captured in order; frames with metadata `file_name` containing `.partN` are intermediate stream frames, and the final frame is the last one whose metadata `file_name` has no `.partN`.
 
 Upload reference files before generation (comma-separated):
 
@@ -115,6 +116,13 @@ curl -s -X POST http://localhost:4280/open \
 curl -s "http://localhost:4280/context?id=<contextId>" | jq '.context.streamEvents'
 ```
 
+Image stream events include per-frame flags you can use to recreate the ChatGPT loading animation:
+
+- `sourceFileName` (metadata `file_name` from ChatGPT)
+- `isStreamPart` (`true` for `.partN` frames)
+- `streamPartIndex` (numeric part index when present)
+- `isFinalStreamFrame` (`true` when `sourceFileName` has no `.partN`)
+
 Use sync mode with randomized filenames:
 
 ```bash
@@ -156,6 +164,9 @@ Optional env vars:
 - `PW_FORCE_PROJECT_PROMPT` (`true`/`false`, default: `false`) to re-prompt for a project folder even if sessions exist
 - `PW_STORAGE_DIR` (default: `.agent-playwright`)
 - `PW_OUTPUT_DIR` (default: `generations`)
+- `PW_DOWNLOADS_DIR` (default: same as `PW_OUTPUT_DIR`; Playwright browser-managed downloads location)
+- `PW_PREFER_CURL_DOWNLOADS` (`true`/`false`, default: `true`) for file-mode direct URL fetching via curl before Playwright fallback
+- `PW_CURL_TIMEOUT_MS` (default: `25000`) timeout for curl/HTTP file download fetches
 - `PW_START_URL` (optional)
 - `PW_VIEWPORT` (e.g. `1280x720`)
 - `PW_NAV_TIMEOUT_MS` (default: `30000`)
@@ -208,7 +219,8 @@ Cookies, localStorage, and session state are stored in `PW_STORAGE_DIR` so the s
 - With non-sync mode, `/open` returns `contextId` and `contextFile`; use `GET /context?id=...` to inspect completion later.
 - There is no SSE/WebSocket stream endpoint yet; for live integration, poll `GET /context?id=...` and read `context.streamEvents` plus `context.keepAlive`.
 - Keep-alive/progress is written to context while running: `keepAlive.lastActivityAt`, `keepAlive.heartbeatSeq`, `keepAlive.lastMetadataId`, `keepAlive.lastOutputPath`, plus `observedMetadataIds`, `observedOutputFiles`, and recent `events`.
-- Context now also includes `streamEvents` (rolling history) with structured stream/download capture details such as source, resolved URL, metadata id, saved output path, byte length, and failures.
+- Context now also includes `streamEvents` (rolling history) with structured stream/download capture details such as source, resolved URL, metadata id, saved output path, byte length, failures, and image frame markers (`sourceFileName`, `isStreamPart`, `streamPartIndex`, `isFinalStreamFrame`).
+- In sync image runs, `savedFiles` is normalized to one final stable output path (the last captured final frame, i.e. non-`.partN` when available).
 - Assistant clarification questions are logged to console and stored in context (`assistantQuestion`, `keepAlive.waitingForUserInput`, `keepAlive.lastAssistantMessage`).
 - Assistant generation errors (e.g. image/file generation failures) are captured as `assistantError` and `keepAlive.lastErrorMessage`, and sync runs return `status: "error"` with the message when no file is produced.
 - If an assistant generation error is detected before any file is saved, the service retries once automatically before returning an error.
@@ -218,5 +230,6 @@ Cookies, localStorage, and session state are stored in `PW_STORAGE_DIR` so the s
 - With `files`, `/open` uploads local reference files before prompt submission.
 - `/open` now uses a new automation page by default; set `reusePage: true` only if you want the same page reused.
 - After the download finishes, the page is closed but the browser context stays alive for faster subsequent requests.
+- Transient download popup tabs opened during assistant-link capture are closed during the run (not only at final teardown).
 - If system Chrome crashes in headless mode, unset `PW_EXECUTABLE_PATH`/`PW_CHANNEL` to fall back to bundled Chromium.
 - On macOS, minimizing uses `osascript` and may require Accessibility permissions for the terminal.
