@@ -503,6 +503,35 @@ const isLikelyImageStreamPartName = (value) => {
   return IMAGE_STREAM_PART_SEGMENT_RE.test(name);
 };
 
+const parseImageStreamFrameInfo = (value) => {
+  const fileName =
+    typeof value === "string" && value.trim() ? basename(value.trim()) : "";
+  if (!fileName) {
+    return {
+      fileName: "",
+      isPart: false,
+      partIndex: null,
+      isFinal: false,
+    };
+  }
+  const partMatch = /\.part(\d+)(?=\.[^.]+$|$)/i.exec(fileName);
+  if (!partMatch) {
+    return {
+      fileName,
+      isPart: false,
+      partIndex: null,
+      isFinal: true,
+    };
+  }
+  const parsedPart = Number(partMatch[1]);
+  return {
+    fileName,
+    isPart: true,
+    partIndex: Number.isFinite(parsedPart) ? parsedPart : null,
+    isFinal: false,
+  };
+};
+
 const ensureUniqueOutputPath = (filePath) => {
   if (!existsSync(filePath)) return filePath;
   const parentDir = dirname(filePath);
@@ -546,82 +575,91 @@ const retainLatestImageOnly = async (saveResult) => {
   const streamEvents = Array.isArray(saveResult.streamEvents)
     ? saveResult.streamEvents
     : [];
-  const candidateByPath = new Map();
+  const orderedCandidates = [];
   const pushCandidate = ({
     filePath,
     fileName = "",
+    sourceFileName = "",
     byteLength = null,
     contentType = "",
     metadataId = null,
+    isStreamPart = false,
+    streamPartIndex = null,
+    isFinalStreamFrame = false,
   }) => {
     if (typeof filePath !== "string" || !filePath.trim()) return;
     const normalizedPath = filePath.trim();
-    const existing = candidateByPath.get(normalizedPath);
-    if (!existing) {
-      candidateByPath.set(normalizedPath, {
-        filePath: normalizedPath,
-        fileName:
-          typeof fileName === "string" && fileName.trim()
-            ? basename(fileName.trim())
-            : basename(normalizedPath),
-        byteLength: Number.isFinite(byteLength) ? byteLength : null,
-        contentType: typeof contentType === "string" ? contentType : "",
-        metadataId: typeof metadataId === "string" ? metadataId : null,
-      });
-      return;
-    }
-    if (!existing.fileName && fileName) {
-      existing.fileName = basename(fileName);
-    }
-    if (!Number.isFinite(existing.byteLength) && Number.isFinite(byteLength)) {
-      existing.byteLength = byteLength;
-    }
-    if (!existing.contentType && contentType) {
-      existing.contentType = contentType;
-    }
-    if (!existing.metadataId && metadataId) {
-      existing.metadataId = metadataId;
-    }
+    orderedCandidates.push({
+      filePath: normalizedPath,
+      fileName:
+        typeof fileName === "string" && fileName.trim()
+          ? basename(fileName.trim())
+          : basename(normalizedPath),
+      sourceFileName:
+        typeof sourceFileName === "string" && sourceFileName.trim()
+          ? basename(sourceFileName.trim())
+          : "",
+      byteLength: Number.isFinite(byteLength) ? byteLength : null,
+      contentType: typeof contentType === "string" ? contentType : "",
+      metadataId: typeof metadataId === "string" ? metadataId : null,
+      isStreamPart: isStreamPart === true,
+      streamPartIndex: Number.isFinite(streamPartIndex) ? streamPartIndex : null,
+      isFinalStreamFrame: isFinalStreamFrame === true,
+    });
   };
 
-  for (const file of savedFiles) {
-    pushCandidate(file);
-  }
   for (const event of streamEvents) {
     if (!event || typeof event !== "object") continue;
+    if (event.type !== "file_saved") continue;
     pushCandidate({
       filePath: event.outputPath,
       fileName: event.fileName,
+      sourceFileName: event.sourceFileName,
       byteLength: event.byteLength,
       contentType: event.contentType,
       metadataId: event.metadataId,
+      isStreamPart: event.isStreamPart === true,
+      streamPartIndex: event.streamPartIndex,
+      isFinalStreamFrame: event.isFinalStreamFrame === true,
     });
   }
+  for (const file of savedFiles) {
+    pushCandidate(file);
+  }
 
-  const candidates = [...candidateByPath.values()];
-  if (candidates.length === 0) {
+  if (orderedCandidates.length === 0) {
     return saveResult;
   }
 
-  const existingCandidates = candidates.filter((entry) =>
-    existsSync(entry.filePath),
-  );
-  const existingNonPartCandidates = existingCandidates.filter(
-    (entry) =>
-      !isLikelyImageStreamPartName(entry.fileName) &&
-      !isLikelyImageStreamPartName(entry.filePath),
-  );
-  const nonPartCandidates = candidates.filter(
-    (entry) =>
-      !isLikelyImageStreamPartName(entry.fileName) &&
-      !isLikelyImageStreamPartName(entry.filePath),
-  );
-  const selected =
-    existingNonPartCandidates[existingNonPartCandidates.length - 1] ||
-    existingCandidates[existingCandidates.length - 1] ||
-    nonPartCandidates[nonPartCandidates.length - 1] ||
-    candidates[candidates.length - 1] ||
-    null;
+  let selected = null;
+  const existingFinalCandidates = [];
+  const existingFinalByPath = new Set();
+  for (let index = orderedCandidates.length - 1; index >= 0; index -= 1) {
+    const candidate = orderedCandidates[index];
+    if (!existsSync(candidate.filePath)) {
+      continue;
+    }
+    if (
+      candidate.isFinalStreamFrame === true ||
+      (candidate.sourceFileName &&
+        !isLikelyImageStreamPartName(candidate.sourceFileName))
+    ) {
+      if (!existingFinalByPath.has(candidate.filePath)) {
+        existingFinalByPath.add(candidate.filePath);
+        existingFinalCandidates.push(candidate);
+      }
+      continue;
+    }
+    if (!selected) {
+      selected = candidate;
+    }
+  }
+  if (existingFinalCandidates.length > 0) {
+    selected = existingFinalCandidates[0];
+  }
+  if (!selected) {
+    selected = orderedCandidates[orderedCandidates.length - 1];
+  }
   if (!selected) {
     return saveResult;
   }
@@ -638,13 +676,12 @@ const retainLatestImageOnly = async (saveResult) => {
     // keep existing byteLength when stat fails
   }
 
-  const pathsToDelete = new Set();
-  for (const candidate of candidates) {
-    if (!candidate?.filePath || candidate.filePath === selected.filePath) {
-      continue;
-    }
-    pathsToDelete.add(candidate.filePath);
-  }
+  const pathsToDelete = new Set(
+    orderedCandidates
+      .map((candidate) => candidate?.filePath)
+      .filter(Boolean)
+      .filter((filePath) => filePath !== selected.filePath),
+  );
   for (const path of pathsToDelete) {
     try {
       await unlink(path);
@@ -667,6 +704,13 @@ const retainLatestImageOnly = async (saveResult) => {
         byteLength,
         contentType: selected.contentType || "",
         metadataId: latestMetadataId,
+        sourceFileName: selected.sourceFileName || null,
+        isStreamPart: selected.isStreamPart === true,
+        streamPartIndex: selected.streamPartIndex,
+        isFinalStreamFrame:
+          selected.isFinalStreamFrame === true ||
+          (selected.sourceFileName &&
+            !isLikelyImageStreamPartName(selected.sourceFileName)),
       },
     ],
     latestMetadataId ? [latestMetadataId] : [],
@@ -1750,6 +1794,19 @@ const collectChatGptDownloads = async (
       metadataId,
       imageRun,
     });
+    const savedEntry = {
+      ...saved,
+      sourceFileName:
+        typeof eventMeta.sourceFileName === "string" &&
+        eventMeta.sourceFileName
+          ? eventMeta.sourceFileName
+          : null,
+      isStreamPart: eventMeta.isStreamPart === true,
+      streamPartIndex: Number.isFinite(eventMeta.streamPartIndex)
+        ? eventMeta.streamPartIndex
+        : null,
+      isFinalStreamFrame: eventMeta.isFinalStreamFrame === true,
+    };
     emitStreamEvent({
       type: "file_saved",
       source: eventMeta.source || "stream_response",
@@ -1757,12 +1814,16 @@ const collectChatGptDownloads = async (
       downloadUrl: eventMeta.downloadUrl || null,
       metadataId: metadataId || null,
       contentType: contentType || null,
-      fileName: saved?.fileName || null,
-      outputPath: saved?.filePath || null,
-      byteLength: saved?.byteLength ?? buffer?.byteLength ?? null,
-      message: `Saved ${saved?.fileName || "download"}`,
+      fileName: savedEntry?.fileName || null,
+      sourceFileName: savedEntry?.sourceFileName || null,
+      outputPath: savedEntry?.filePath || null,
+      byteLength: savedEntry?.byteLength ?? buffer?.byteLength ?? null,
+      isStreamPart: savedEntry.isStreamPart === true,
+      streamPartIndex: savedEntry.streamPartIndex,
+      isFinalStreamFrame: savedEntry.isFinalStreamFrame === true,
+      message: `Saved ${savedEntry?.fileName || "download"}`,
     });
-    savedFiles.push(saved);
+    savedFiles.push(savedEntry);
     if (metadataId) {
       metadataIds.add(metadataId);
     }
@@ -1782,10 +1843,13 @@ const collectChatGptDownloads = async (
     const isDownload = pathname.startsWith("/backend-api/files/download/");
     if (!isEstuary && !isDownload) return;
 
-    const responseFileId = extractFileId(response.url());
-    const dedupeKey = responseFileId || response.url();
-    if (seen.has(dedupeKey)) return;
-    seen.add(dedupeKey);
+    const isImageRun = imageRun?.generationMode === "image";
+    if (!isImageRun) {
+      const responseFileId = extractFileId(response.url());
+      const dedupeKey = responseFileId || response.url();
+      if (seen.has(dedupeKey)) return;
+      seen.add(dedupeKey);
+    }
 
     const contentType = response.headers()["content-type"] ?? "";
     if (isDownload && isJsonContentType(contentType)) {
@@ -1794,7 +1858,8 @@ const collectChatGptDownloads = async (
         console.log("Received file download metadata:", fileInfo);
         const downloadUrl = fileInfo?.download_url;
         if (typeof downloadUrl === "string" && downloadUrl) {
-          const metadataId = extractFileId(downloadUrl) || responseFileId;
+          const metadataId =
+            extractFileId(downloadUrl) || extractFileId(response.url());
           emitStreamEvent({
             type: "download_url_resolved",
             source: "files_download_metadata",
@@ -1815,6 +1880,7 @@ const collectChatGptDownloads = async (
             typeof fileInfo?.file_name === "string"
               ? basename(fileInfo.file_name)
               : "";
+          const frameInfo = parseImageStreamFrameInfo(metadataFileNameRaw);
           const shouldUseMetadataFileName =
             Boolean(metadataFileNameRaw) &&
             !(
@@ -1836,6 +1902,10 @@ const collectChatGptDownloads = async (
               source: "files_download_metadata",
               responseUrl: response.url(),
               downloadUrl,
+              sourceFileName: frameInfo.fileName || null,
+              isStreamPart: frameInfo.isPart,
+              streamPartIndex: frameInfo.partIndex,
+              isFinalStreamFrame: frameInfo.isFinal,
             },
           );
         } else {
@@ -1843,7 +1913,7 @@ const collectChatGptDownloads = async (
             type: "metadata_missing_download_url",
             source: "files_download_metadata",
             responseUrl: response.url(),
-            metadataId: responseFileId || null,
+            metadataId: extractFileId(response.url()) || null,
             contentType: contentType || null,
             message: "Metadata response did not include download_url",
           });
@@ -1854,7 +1924,7 @@ const collectChatGptDownloads = async (
           type: "save_failed",
           source: "files_download_metadata",
           responseUrl: response.url(),
-          metadataId: responseFileId || null,
+          metadataId: extractFileId(response.url()) || null,
           contentType: contentType || null,
           message: error?.message ?? String(error),
         });
@@ -1863,6 +1933,7 @@ const collectChatGptDownloads = async (
     }
 
     if (!isJsonContentType(contentType)) {
+      const responseFileId = extractFileId(response.url());
       const contentDisposition = response.headers()["content-disposition"] ?? "";
       const fromHeader = parseContentDispositionFileName(contentDisposition);
       const nameHint = fromHeader
