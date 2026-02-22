@@ -1740,6 +1740,7 @@ const collectChatGptDownloads = async (
     idleMs = 3_000,
     maxFiles = 4,
     imageRun = null,
+    requireFinalImageFrame = false,
     onStreamEvent = () => undefined,
   } = {},
 ) => {
@@ -1752,6 +1753,8 @@ const collectChatGptDownloads = async (
   const savedFiles = [];
   const streamEvents = [];
   let queue = Promise.resolve();
+  let sawImageStreamPartFrame = false;
+  let sawImageFinalFrame = false;
 
   const emitStreamEvent = (event) => {
     if (!event || typeof event !== "object") return;
@@ -1778,6 +1781,13 @@ const collectChatGptDownloads = async (
   const scheduleIdleCheck = () => {
     if (idleTimer) clearTimeout(idleTimer);
     if (savedCount === 0) return;
+    if (
+      requireFinalImageFrame &&
+      sawImageStreamPartFrame &&
+      !sawImageFinalFrame
+    ) {
+      return;
+    }
     idleTimer = setTimeout(() => finish(), idleMs);
   };
 
@@ -1824,12 +1834,30 @@ const collectChatGptDownloads = async (
       message: `Saved ${savedEntry?.fileName || "download"}`,
     });
     savedFiles.push(savedEntry);
+    if (requireFinalImageFrame && imageRun?.generationMode === "image") {
+      if (savedEntry.isStreamPart === true) {
+        sawImageStreamPartFrame = true;
+      }
+      if (savedEntry.isFinalStreamFrame === true) {
+        sawImageFinalFrame = true;
+      }
+    }
     if (metadataId) {
       metadataIds.add(metadataId);
     }
     savedCount += 1;
     if (savedCount >= maxFiles) {
       finish();
+    } else if (
+      requireFinalImageFrame &&
+      imageRun?.generationMode === "image" &&
+      sawImageFinalFrame
+    ) {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () => finish(),
+        Math.min(Math.max(500, idleMs), 1_500),
+      );
     } else {
       scheduleIdleCheck();
     }
@@ -2728,6 +2756,7 @@ const runChatGptPromptFlow = async (
       maxFiles:
         generationMode === "image" ? Number.MAX_SAFE_INTEGER : config.imageMax,
       imageRun,
+      requireFinalImageFrame: generationMode === "image" && !streamMode,
       onStreamEvent: (streamEvent) => {
         emitActivity({
           type: "stream_event",
