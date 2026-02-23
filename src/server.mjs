@@ -575,7 +575,40 @@ const retainLatestImageOnly = async (saveResult) => {
   const streamEvents = Array.isArray(saveResult.streamEvents)
     ? saveResult.streamEvents
     : [];
+  const frameInfoByMetadataId = new Map();
+  const finalFrameMetadataIds = [];
   const orderedCandidates = [];
+  for (const event of streamEvents) {
+    if (!event || typeof event !== "object") continue;
+    if (event.type !== "download_url_resolved") continue;
+    const metadataId =
+      typeof event.metadataId === "string" && event.metadataId
+        ? event.metadataId
+        : null;
+    if (!metadataId) continue;
+    const sourceFileName =
+      typeof event.sourceFileName === "string" && event.sourceFileName.trim()
+        ? basename(event.sourceFileName.trim())
+        : "";
+    const isFinalStreamFrame =
+      event.isFinalStreamFrame === true ||
+      (sourceFileName && !isLikelyImageStreamPartName(sourceFileName));
+    const isStreamPart =
+      event.isStreamPart === true ||
+      (sourceFileName ? isLikelyImageStreamPartName(sourceFileName) : false);
+    const streamPartIndex = Number.isFinite(event.streamPartIndex)
+      ? event.streamPartIndex
+      : null;
+    frameInfoByMetadataId.set(metadataId, {
+      sourceFileName,
+      isFinalStreamFrame,
+      isStreamPart,
+      streamPartIndex,
+    });
+    if (isFinalStreamFrame) {
+      finalFrameMetadataIds.push(metadataId);
+    }
+  }
   const pushCandidate = ({
     filePath,
     fileName = "",
@@ -589,22 +622,46 @@ const retainLatestImageOnly = async (saveResult) => {
   }) => {
     if (typeof filePath !== "string" || !filePath.trim()) return;
     const normalizedPath = filePath.trim();
+    const normalizedMetadataId =
+      typeof metadataId === "string" && metadataId ? metadataId : null;
+    const metadataFrameInfo =
+      normalizedMetadataId && frameInfoByMetadataId.has(normalizedMetadataId)
+        ? frameInfoByMetadataId.get(normalizedMetadataId)
+        : null;
+    const normalizedSourceFileName =
+      typeof sourceFileName === "string" && sourceFileName.trim()
+        ? basename(sourceFileName.trim())
+        : metadataFrameInfo?.sourceFileName || "";
+    const normalizedIsFinalStreamFrame =
+      isFinalStreamFrame === true ||
+      (normalizedSourceFileName &&
+        !isLikelyImageStreamPartName(normalizedSourceFileName)) ||
+      metadataFrameInfo?.isFinalStreamFrame === true;
+    const normalizedIsStreamPart =
+      isStreamPart === true ||
+      (normalizedSourceFileName
+        ? isLikelyImageStreamPartName(normalizedSourceFileName)
+        : false) ||
+      metadataFrameInfo?.isStreamPart === true;
+    const normalizedStreamPartIndex =
+      Number.isFinite(streamPartIndex)
+        ? streamPartIndex
+        : Number.isFinite(metadataFrameInfo?.streamPartIndex)
+          ? metadataFrameInfo.streamPartIndex
+          : null;
     orderedCandidates.push({
       filePath: normalizedPath,
       fileName:
         typeof fileName === "string" && fileName.trim()
           ? basename(fileName.trim())
           : basename(normalizedPath),
-      sourceFileName:
-        typeof sourceFileName === "string" && sourceFileName.trim()
-          ? basename(sourceFileName.trim())
-          : "",
+      sourceFileName: normalizedSourceFileName,
       byteLength: Number.isFinite(byteLength) ? byteLength : null,
       contentType: typeof contentType === "string" ? contentType : "",
-      metadataId: typeof metadataId === "string" ? metadataId : null,
-      isStreamPart: isStreamPart === true,
-      streamPartIndex: Number.isFinite(streamPartIndex) ? streamPartIndex : null,
-      isFinalStreamFrame: isFinalStreamFrame === true,
+      metadataId: normalizedMetadataId,
+      isStreamPart: normalizedIsStreamPart,
+      streamPartIndex: normalizedStreamPartIndex,
+      isFinalStreamFrame: normalizedIsFinalStreamFrame,
     });
   };
 
@@ -631,34 +688,46 @@ const retainLatestImageOnly = async (saveResult) => {
     return saveResult;
   }
 
-  let selected = null;
-  const existingFinalCandidates = [];
-  const existingFinalByPath = new Set();
+  const existingCandidates = [];
+  const seenExistingPaths = new Set();
   for (let index = orderedCandidates.length - 1; index >= 0; index -= 1) {
     const candidate = orderedCandidates[index];
-    if (!existsSync(candidate.filePath)) {
-      continue;
-    }
     if (
-      candidate.isFinalStreamFrame === true ||
-      (candidate.sourceFileName &&
-        !isLikelyImageStreamPartName(candidate.sourceFileName))
+      !candidate ||
+      typeof candidate.filePath !== "string" ||
+      !candidate.filePath
     ) {
-      if (!existingFinalByPath.has(candidate.filePath)) {
-        existingFinalByPath.add(candidate.filePath);
-        existingFinalCandidates.push(candidate);
-      }
       continue;
     }
-    if (!selected) {
-      selected = candidate;
-    }
+    if (seenExistingPaths.has(candidate.filePath)) continue;
+    if (!existsSync(candidate.filePath)) continue;
+    seenExistingPaths.add(candidate.filePath);
+    existingCandidates.push(candidate);
   }
-  if (existingFinalCandidates.length > 0) {
-    selected = existingFinalCandidates[0];
+
+  let selected = null;
+  for (let index = finalFrameMetadataIds.length - 1; index >= 0; index -= 1) {
+    const metadataId = finalFrameMetadataIds[index];
+    const matchingCandidate = existingCandidates.find(
+      (candidate) => candidate.metadataId === metadataId,
+    );
+    if (matchingCandidate) {
+      selected = matchingCandidate;
+      break;
+    }
   }
   if (!selected) {
-    selected = orderedCandidates[orderedCandidates.length - 1];
+    selected =
+      existingCandidates.find(
+        (candidate) =>
+          candidate.isFinalStreamFrame === true ||
+          (candidate.sourceFileName &&
+            !isLikelyImageStreamPartName(candidate.sourceFileName)),
+      ) || null;
+  }
+  if (!selected) {
+    selected =
+      existingCandidates[0] || orderedCandidates[orderedCandidates.length - 1];
   }
   if (!selected) {
     return saveResult;
@@ -1888,14 +1957,26 @@ const collectChatGptDownloads = async (
         if (typeof downloadUrl === "string" && downloadUrl) {
           const metadataId =
             extractFileId(downloadUrl) || extractFileId(response.url());
+          const metadataFileNameRaw =
+            typeof fileInfo?.file_name === "string"
+              ? basename(fileInfo.file_name)
+              : "";
+          const frameInfo = parseImageStreamFrameInfo(metadataFileNameRaw);
           emitStreamEvent({
             type: "download_url_resolved",
             source: "files_download_metadata",
             responseUrl: response.url(),
             downloadUrl,
+            streamFrameUrl: downloadUrl,
             metadataId: metadataId || null,
+            sourceFileName: frameInfo.fileName || null,
+            isStreamPart: frameInfo.isPart,
+            streamPartIndex: frameInfo.partIndex,
+            isFinalStreamFrame: frameInfo.isFinal,
             contentType: contentType || null,
-            message: "Resolved download URL from metadata response",
+            message: frameInfo.isFinal
+              ? "Resolved final stream frame URL from metadata response"
+              : "Resolved stream frame URL from metadata response",
           });
           const {
             buffer,
@@ -1904,11 +1985,6 @@ const collectChatGptDownloads = async (
           } = await fetchDownloadWithRetry(pageInstance, downloadUrl, {
             preferCurl: imageRun?.generationMode === "file",
           });
-          const metadataFileNameRaw =
-            typeof fileInfo?.file_name === "string"
-              ? basename(fileInfo.file_name)
-              : "";
-          const frameInfo = parseImageStreamFrameInfo(metadataFileNameRaw);
           const shouldUseMetadataFileName =
             Boolean(metadataFileNameRaw) &&
             !(
@@ -2756,7 +2832,7 @@ const runChatGptPromptFlow = async (
       maxFiles:
         generationMode === "image" ? Number.MAX_SAFE_INTEGER : config.imageMax,
       imageRun,
-      requireFinalImageFrame: generationMode === "image" && !streamMode,
+      requireFinalImageFrame: generationMode === "image",
       onStreamEvent: (streamEvent) => {
         emitActivity({
           type: "stream_event",

@@ -118,10 +118,19 @@ curl -s "http://localhost:4280/context?id=<contextId>" | jq '.context.streamEven
 
 Image stream events include per-frame flags you can use to recreate the ChatGPT loading animation:
 
+- `downloadUrl` / `streamFrameUrl` (remote ChatGPT URL for that frame; can be used directly by your client)
 - `sourceFileName` (metadata `file_name` from ChatGPT)
 - `isStreamPart` (`true` for `.partN` frames)
 - `streamPartIndex` (numeric part index when present)
 - `isFinalStreamFrame` (`true` when `sourceFileName` has no `.partN`)
+
+`download_url_resolved` events are emitted per frame before local file save, so you can push each incoming frame URL immediately. This works for both:
+
+- async mode (`sync: false`) via `GET /context?id=...` polling
+- sync mode (`sync: true`) via the returned `streamEvents` array
+
+For image mode, these per-frame URL events are emitted in both `stream: true` and `stream: false` runs.
+Sync image finalization picks the saved file that matches the last `download_url_resolved` frame marked final (`sourceFileName` without `.partN`).
 
 Use sync mode with randomized filenames:
 
