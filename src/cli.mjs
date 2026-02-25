@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { basename, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 
@@ -11,6 +11,105 @@ const parseCommaList = (value) => {
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
+};
+
+const WINDOWS_ABS_PATH_RE = /^[a-zA-Z]:[\\/]/;
+const WSL_MOUNT_PATH_RE = /^\/mnt\/([a-zA-Z])\/(.*)$/i;
+const CYGDRIVE_PATH_RE = /^\/cygdrive\/([a-zA-Z])\/(.*)$/i;
+
+const stripWrappingQuotes = (value) => {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+};
+
+const windowsPathToPosixMountPath = (value) => {
+  if (!WINDOWS_ABS_PATH_RE.test(value)) return "";
+  const normalized = value.replace(/\\/g, "/");
+  const drive = normalized.slice(0, 1).toLowerCase();
+  const rest = normalized.slice(2).replace(/^\/+/, "");
+  return `/mnt/${drive}/${rest}`;
+};
+
+const posixMountPathToWindowsPath = (value) => {
+  const normalized = value.replace(/\\/g, "/");
+  const match =
+    WSL_MOUNT_PATH_RE.exec(normalized) || CYGDRIVE_PATH_RE.exec(normalized);
+  if (!match) return "";
+  const drive = match[1].toUpperCase();
+  const rest = (match[2] || "").replace(/\//g, "\\");
+  return rest ? `${drive}:\\${rest}` : `${drive}:\\`;
+};
+
+const isAbsolutePathForAnyPlatform = (value) =>
+  isAbsolute(value) || WINDOWS_ABS_PATH_RE.test(value) || value.startsWith("\\\\");
+
+const expandPathCandidates = (value, { baseDir = process.cwd() } = {}) => {
+  const raw = stripWrappingQuotes(value);
+  if (!raw) return [];
+
+  const ordered = [];
+  const seen = new Set();
+  const push = (candidate) => {
+    if (typeof candidate !== "string") return;
+    const trimmed = candidate.trim();
+    if (!trimmed || seen.has(trimmed)) return;
+    seen.add(trimmed);
+    ordered.push(trimmed);
+  };
+
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      push(fileURLToPath(new URL(raw)));
+    } catch {
+      // ignore malformed file URLs and continue with raw input
+    }
+  }
+
+  const hostMapped =
+    process.platform === "win32"
+      ? posixMountPathToWindowsPath(raw)
+      : windowsPathToPosixMountPath(raw);
+  if (hostMapped) {
+    push(hostMapped);
+  }
+
+  push(raw);
+
+  const wslPath = windowsPathToPosixMountPath(raw);
+  const windowsPath = posixMountPathToWindowsPath(raw);
+  if (wslPath) push(wslPath);
+  if (windowsPath) push(windowsPath);
+
+  if (WINDOWS_ABS_PATH_RE.test(raw)) {
+    push(raw.replace(/\//g, "\\"));
+    push(raw.replace(/\\/g, "/"));
+  }
+
+  if (raw.startsWith("\\\\")) {
+    push(raw.replace(/\\/g, "/"));
+  }
+
+  return ordered.map((candidate) =>
+    isAbsolutePathForAnyPlatform(candidate)
+      ? candidate
+      : resolve(baseDir, candidate),
+  );
+};
+
+const resolvePathInput = (value, { baseDir = process.cwd() } = {}) => {
+  const candidates = expandPathCandidates(value, { baseDir });
+  if (candidates.length > 0) {
+    return candidates[0];
+  }
+  return resolve(baseDir, String(value ?? ""));
 };
 
 const BOOLEAN_FLAGS = new Set([
@@ -69,8 +168,8 @@ const printUsage = (cliName) => {
 
 Options:
   --port            Port for the service (default 4280)
-  --dir             Output directory for generated files
-  --files           Comma-separated file paths to upload before generating
+  --dir             Output directory for generated files (Windows/macOS/Linux paths supported)
+  --files           Comma-separated file paths to upload before generating (Windows/macOS/Linux paths supported)
   --context-id      Continue from a previous context id
   --answer          Follow-up answer prompt used with --context-id
   --count           Number of parallel generations to start (default 1, max 8)
@@ -99,7 +198,9 @@ const main = async () => {
   if (command === "serve") {
     const serveOpts = parseArgs(argv.slice(1));
     if (typeof serveOpts.dir === "string" && serveOpts.dir.trim()) {
-      process.env.PW_OUTPUT_DIR = resolve(process.cwd(), serveOpts.dir.trim());
+      process.env.PW_OUTPUT_DIR = resolvePathInput(serveOpts.dir.trim(), {
+        baseDir: process.cwd(),
+      });
     }
     await import("./server.mjs");
     return;
@@ -133,14 +234,18 @@ const main = async () => {
 
   const resolvedDir =
     typeof opts.dir === "string" && opts.dir.trim()
-      ? resolve(process.cwd(), opts.dir.trim())
+      ? resolvePathInput(opts.dir.trim(), { baseDir: process.cwd() })
       : undefined;
   const rawFiles = [
     ...parseCommaList(opts.files),
     ...parseCommaList(opts.file),
   ];
   const resolvedFiles = [
-    ...new Set(rawFiles.map((entry) => resolve(process.cwd(), entry))),
+    ...new Set(
+      rawFiles.map((entry) =>
+        resolvePathInput(entry, { baseDir: process.cwd() }),
+      ),
+    ),
   ];
 
   const payload = {

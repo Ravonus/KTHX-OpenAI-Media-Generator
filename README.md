@@ -66,11 +66,14 @@ Nested folders are created automatically (relative to your current directory):
 generateImage --dir ./path/path2/path3 \"Generate an image of a dune worm\"
 ```
 
-`--dir` paths from the CLI are resolved from the directory where you run the command.
+`--dir` and `--files` accept Windows (`C:\...`), macOS/Linux (`/Users/...`, `/home/...`), and WSL (`/mnt/c/...`) path styles.
+Relative paths are resolved from the directory where you run the command.
 
 You can force behavior with `--mode image|file|auto` on either CLI command.
 Use `--stream` to enable stream-first network capture before fallback download handling.
 This is opportunistic: images usually stream cleanly, while some file types only expose a clickable download link later, so fallback handling still runs.
+When reference uploads are attached, stream capture ignores files whose names match uploaded filenames to avoid treating inputs as generated outputs.
+When reference uploads are attached, stream metadata responses with both `file_name` and `file_size_bytes` unset are treated as upload echoes and ignored.
 For image mode, each streamed frame is captured in order; frames with metadata `file_name` containing `.partN` are intermediate stream frames, and the final frame is the last one whose metadata `file_name` has no `.partN`.
 
 Upload reference files before generation (comma-separated):
@@ -78,6 +81,8 @@ Upload reference files before generation (comma-separated):
 ```bash
 generateImage --files ./selfie1.png,./selfie2.png \"Create a portrait in this style\"
 ```
+
+When files are attached for image mode, the prompt is sent as-is (the default `Generate an image of:` prefix is skipped).
 
 Continue from a prior context id with a follow-up answer prompt:
 
@@ -227,6 +232,7 @@ Cookies, localStorage, and session state are stored in `PW_STORAGE_DIR` so the s
 - With `sync: true`, `/open` waits for downloads and returns `savedFiles`, `metadataIds`, and a full `context` JSON object.
 - With non-sync mode, `/open` returns `contextId` and `contextFile`; use `GET /context?id=...` to inspect completion later.
 - There is no SSE/WebSocket stream endpoint yet; for live integration, poll `GET /context?id=...` and read `context.streamEvents` plus `context.keepAlive`.
+- For `dir`, `files`, `filePaths`, and `file`, the service accepts Windows/macOS/Linux path formats and normalizes them on the host.
 - Keep-alive/progress is written to context while running: `keepAlive.lastActivityAt`, `keepAlive.heartbeatSeq`, `keepAlive.lastMetadataId`, `keepAlive.lastOutputPath`, plus `observedMetadataIds`, `observedOutputFiles`, and recent `events`.
 - Context now also includes `streamEvents` (rolling history) with structured stream/download capture details such as source, resolved URL, metadata id, saved output path, byte length, failures, and image frame markers (`sourceFileName`, `isStreamPart`, `streamPartIndex`, `isFinalStreamFrame`).
 - In sync image runs, `savedFiles` is normalized to one final stable output path (the last captured final frame, i.e. non-`.partN` when available).

@@ -2,9 +2,10 @@ import http from "node:http";
 import { copyFile, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { basename, dirname, extname, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { chromium, firefox, webkit } from "playwright";
 
@@ -120,18 +121,119 @@ const parseContentDispositionFileName = (headerValue) => {
 const isJsonContentType = (contentType) =>
   normalizeContentType(contentType) === "application/json";
 
+const WINDOWS_ABS_PATH_RE = /^[a-zA-Z]:[\\/]/;
+const WSL_MOUNT_PATH_RE = /^\/mnt\/([a-zA-Z])\/(.*)$/i;
+const CYGDRIVE_PATH_RE = /^\/cygdrive\/([a-zA-Z])\/(.*)$/i;
+
+const stripWrappingQuotes = (value) => {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+};
+
+const windowsPathToPosixMountPath = (value) => {
+  if (!WINDOWS_ABS_PATH_RE.test(value)) return "";
+  const normalized = value.replace(/\\/g, "/");
+  const drive = normalized.slice(0, 1).toLowerCase();
+  const rest = normalized.slice(2).replace(/^\/+/, "");
+  return `/mnt/${drive}/${rest}`;
+};
+
+const posixMountPathToWindowsPath = (value) => {
+  const normalized = value.replace(/\\/g, "/");
+  const match =
+    WSL_MOUNT_PATH_RE.exec(normalized) || CYGDRIVE_PATH_RE.exec(normalized);
+  if (!match) return "";
+  const drive = match[1].toUpperCase();
+  const rest = (match[2] || "").replace(/\//g, "\\");
+  return rest ? `${drive}:\\${rest}` : `${drive}:\\`;
+};
+
+const isAbsolutePathForAnyPlatform = (value) =>
+  isAbsolute(value) || WINDOWS_ABS_PATH_RE.test(value) || value.startsWith("\\\\");
+
+const expandPathCandidates = (value, { baseDir = process.cwd() } = {}) => {
+  const raw = stripWrappingQuotes(value);
+  if (!raw) return [];
+
+  const ordered = [];
+  const seen = new Set();
+  const push = (candidate) => {
+    if (typeof candidate !== "string") return;
+    const trimmed = candidate.trim();
+    if (!trimmed || seen.has(trimmed)) return;
+    seen.add(trimmed);
+    ordered.push(trimmed);
+  };
+
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      push(fileURLToPath(new URL(raw)));
+    } catch {
+      // ignore malformed file URLs and continue with raw input
+    }
+  }
+
+  const hostMapped =
+    process.platform === "win32"
+      ? posixMountPathToWindowsPath(raw)
+      : windowsPathToPosixMountPath(raw);
+  if (hostMapped) {
+    push(hostMapped);
+  }
+
+  push(raw);
+
+  const wslPath = windowsPathToPosixMountPath(raw);
+  const windowsPath = posixMountPathToWindowsPath(raw);
+  if (wslPath) push(wslPath);
+  if (windowsPath) push(windowsPath);
+
+  if (WINDOWS_ABS_PATH_RE.test(raw)) {
+    push(raw.replace(/\//g, "\\"));
+    push(raw.replace(/\\/g, "/"));
+  }
+
+  if (raw.startsWith("\\\\")) {
+    push(raw.replace(/\\/g, "/"));
+  }
+
+  return ordered.map((candidate) =>
+    isAbsolutePathForAnyPlatform(candidate)
+      ? candidate
+      : resolve(baseDir, candidate),
+  );
+};
+
+const resolvePathInput = (value, { baseDir = process.cwd() } = {}) => {
+  const candidates = expandPathCandidates(value, { baseDir });
+  if (candidates.length > 0) {
+    return candidates[0];
+  }
+  return resolve(baseDir, String(value ?? ""));
+};
+
 const config = {
   port: numberFromEnv("PW_PORT", numberFromEnv("PORT", 4280)),
-  storageDir: resolve(
-    process.cwd(),
+  storageDir: resolvePathInput(
     process.env.PW_STORAGE_DIR ?? ".agent-playwright",
+    { baseDir: process.cwd() },
   ),
   storageDirFromEnv: Boolean(process.env.PW_STORAGE_DIR),
-  outputDir: resolve(process.cwd(), process.env.PW_OUTPUT_DIR ?? "generations"),
+  outputDir: resolvePathInput(process.env.PW_OUTPUT_DIR ?? "generations", {
+    baseDir: process.cwd(),
+  }),
   outputDirFromEnv: Boolean(process.env.PW_OUTPUT_DIR),
-  downloadsDir: resolve(
-    process.cwd(),
+  downloadsDir: resolvePathInput(
     process.env.PW_DOWNLOADS_DIR ?? (process.env.PW_OUTPUT_DIR ?? "generations"),
+    { baseDir: process.cwd() },
   ),
   headlessInitial: boolFromEnv("PW_HEADLESS", false),
   headlessAfterAuth: boolFromEnv("PW_HEADLESS_AFTER_AUTH", false),
@@ -167,7 +269,7 @@ const config = {
   slowMoMs: numberFromEnv("PW_SLOWMO_MS", 0),
   extraArgs: parseArgs(process.env.PW_ARGS ?? ""),
   projectDir: process.env.PW_PROJECT_DIR
-    ? resolve(process.cwd(), process.env.PW_PROJECT_DIR)
+    ? resolvePathInput(process.env.PW_PROJECT_DIR, { baseDir: process.cwd() })
     : null,
   forceProjectPrompt: boolFromEnv("PW_FORCE_PROJECT_PROMPT", false),
   chatGptProjectUrl: process.env.PW_CHATGPT_PROJECT_URL ?? "",
@@ -251,7 +353,7 @@ const persistContextRun = async (record) => {
 const setOutputDir = async (value) => {
   const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed) return config.outputDir;
-  config.outputDir = resolve(process.cwd(), trimmed);
+  config.outputDir = resolvePathInput(trimmed, { baseDir: process.cwd() });
   await ensureOutputDir();
   return config.outputDir;
 };
@@ -276,7 +378,7 @@ const promptForProjectDir = async () => {
   rl.close();
   const trimmed = answer.trim();
   if (!trimmed) return null;
-  return resolve(trimmed);
+  return resolvePathInput(trimmed, { baseDir: process.cwd() });
 };
 
 const detectBrowserExecutable = () => {
@@ -430,7 +532,11 @@ const ensureConfig = async () => {
     }
   }
 
-  let projectDir = config.projectDir ?? storedProjectDir;
+  const projectDirSeed = config.projectDir ?? storedProjectDir;
+  let projectDir =
+    typeof projectDirSeed === "string" && projectDirSeed.trim()
+      ? resolvePathInput(projectDirSeed, { baseDir: process.cwd() })
+      : null;
   const defaultStorageDir = resolve(process.cwd(), ".agent-playwright");
   const hasDefaultSession = await hasSessionData(defaultStorageDir);
   if (
@@ -532,6 +638,22 @@ const parseImageStreamFrameInfo = (value) => {
   };
 };
 
+const normalizeMatchFileName = (value) => {
+  if (typeof value !== "string" || !value.trim()) return "";
+  return basename(value.trim()).toLowerCase();
+};
+
+const isLikelyUploadEchoMetadata = (fileInfo) => {
+  if (!fileInfo || typeof fileInfo !== "object") return false;
+  const fileName =
+    typeof fileInfo.file_name === "string" ? fileInfo.file_name.trim() : "";
+  const fileSize = fileInfo.file_size_bytes;
+  const hasFileName = Boolean(fileName);
+  const hasFileSize =
+    Number.isFinite(Number(fileSize)) && Number(fileSize) > 0;
+  return !hasFileName && !hasFileSize;
+};
+
 const ensureUniqueOutputPath = (filePath) => {
   if (!existsSync(filePath)) return filePath;
   const parentDir = dirname(filePath);
@@ -577,6 +699,8 @@ const retainLatestImageOnly = async (saveResult) => {
     : [];
   const frameInfoByMetadataId = new Map();
   const finalFrameMetadataIds = [];
+  const preferredFinalFrameMetadataIds = [];
+  let sawPartFrameInSequence = false;
   const orderedCandidates = [];
   for (const event of streamEvents) {
     if (!event || typeof event !== "object") continue;
@@ -605,8 +729,14 @@ const retainLatestImageOnly = async (saveResult) => {
       isStreamPart,
       streamPartIndex,
     });
+    if (isStreamPart) {
+      sawPartFrameInSequence = true;
+    }
     if (isFinalStreamFrame) {
       finalFrameMetadataIds.push(metadataId);
+      if (sawPartFrameInSequence) {
+        preferredFinalFrameMetadataIds.push(metadataId);
+      }
     }
   }
   const pushCandidate = ({
@@ -706,7 +836,18 @@ const retainLatestImageOnly = async (saveResult) => {
   }
 
   let selected = null;
+  for (let index = preferredFinalFrameMetadataIds.length - 1; index >= 0; index -= 1) {
+    const metadataId = preferredFinalFrameMetadataIds[index];
+    const matchingCandidate = existingCandidates.find(
+      (candidate) => candidate.metadataId === metadataId,
+    );
+    if (matchingCandidate) {
+      selected = matchingCandidate;
+      break;
+    }
+  }
   for (let index = finalFrameMetadataIds.length - 1; index >= 0; index -= 1) {
+    if (selected) break;
     const metadataId = finalFrameMetadataIds[index];
     const matchingCandidate = existingCandidates.find(
       (candidate) => candidate.metadataId === metadataId,
@@ -1810,6 +1951,8 @@ const collectChatGptDownloads = async (
     maxFiles = 4,
     imageRun = null,
     requireFinalImageFrame = false,
+    waitForConvoStreamCompleted = false,
+    ignoreFileNames = [],
     onStreamEvent = () => undefined,
   } = {},
 ) => {
@@ -1824,6 +1967,43 @@ const collectChatGptDownloads = async (
   let queue = Promise.resolve();
   let sawImageStreamPartFrame = false;
   let sawImageFinalFrame = false;
+  let convoStreamCompleted = !waitForConvoStreamCompleted;
+  const ignoredFileNameSet = new Set(
+    (Array.isArray(ignoreFileNames) ? ignoreFileNames : [])
+      .map((entry) => normalizeMatchFileName(entry))
+      .filter(Boolean),
+  );
+
+  const markConvoStreamCompleted = (details = null) => {
+    if (convoStreamCompleted) return;
+    convoStreamCompleted = true;
+    emitStreamEvent({
+      type: "convo_stream_completed",
+      source: "ces_stream_event",
+      conversationId:
+        details && typeof details.conversationId === "string"
+          ? details.conversationId
+          : null,
+      turnTraceId:
+        details && typeof details.turnTraceId === "string"
+          ? details.turnTraceId
+          : null,
+      result:
+        details && typeof details.result === "string"
+          ? details.result
+          : null,
+      message: "Conversation stream completed",
+    });
+    if (savedCount === 0) return;
+    if (requireFinalImageFrame && sawImageStreamPartFrame && !sawImageFinalFrame) {
+      return;
+    }
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(
+      () => finish(),
+      Math.min(Math.max(600, idleMs), 1_500),
+    );
+  };
 
   const emitStreamEvent = (event) => {
     if (!event || typeof event !== "object") return;
@@ -1833,6 +2013,20 @@ const collectChatGptDownloads = async (
     }
     streamEvents.push(entry);
     Promise.resolve(onStreamEvent(entry)).catch(() => undefined);
+  };
+
+  const shouldIgnoreCapturedFile = ({
+    fileName = "",
+    sourceFileName = "",
+  } = {}) => {
+    if (ignoredFileNameSet.size === 0) return false;
+    const normalizedFileName = normalizeMatchFileName(fileName);
+    const normalizedSourceFileName = normalizeMatchFileName(sourceFileName);
+    return (
+      (normalizedFileName && ignoredFileNameSet.has(normalizedFileName)) ||
+      (normalizedSourceFileName &&
+        ignoredFileNameSet.has(normalizedSourceFileName))
+    );
   };
 
   const cleanup = () => {
@@ -1857,6 +2051,9 @@ const collectChatGptDownloads = async (
     ) {
       return;
     }
+    if (requireFinalImageFrame && sawImageFinalFrame && !convoStreamCompleted) {
+      return;
+    }
     idleTimer = setTimeout(() => finish(), idleMs);
   };
 
@@ -1867,6 +2064,36 @@ const collectChatGptDownloads = async (
     metadataId = null,
     eventMeta = {},
   ) => {
+    if (
+      shouldIgnoreCapturedFile({
+        fileName: nameHint,
+        sourceFileName:
+          typeof eventMeta.sourceFileName === "string"
+            ? eventMeta.sourceFileName
+            : "",
+      })
+    ) {
+      emitStreamEvent({
+        type: "file_ignored",
+        source: eventMeta.source || "stream_response",
+        responseUrl: eventMeta.responseUrl || null,
+        downloadUrl: eventMeta.downloadUrl || null,
+        metadataId: metadataId || null,
+        fileName:
+          typeof nameHint === "string" && nameHint.trim()
+            ? basename(nameHint.trim())
+            : null,
+        sourceFileName:
+          typeof eventMeta.sourceFileName === "string" &&
+          eventMeta.sourceFileName.trim()
+            ? basename(eventMeta.sourceFileName.trim())
+            : null,
+        reason: "matches_upload_reference_name",
+        message:
+          "Ignored captured file because it matches an uploaded reference filename",
+      });
+      return;
+    }
     const saved = await saveBufferToDisk(buffer, {
       fileName: nameHint || `download-${Date.now()}`,
       contentType,
@@ -1920,7 +2147,8 @@ const collectChatGptDownloads = async (
     } else if (
       requireFinalImageFrame &&
       imageRun?.generationMode === "image" &&
-      sawImageFinalFrame
+      sawImageFinalFrame &&
+      convoStreamCompleted
     ) {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(
@@ -1953,6 +2181,23 @@ const collectChatGptDownloads = async (
       try {
         const fileInfo = await response.json();
         console.log("Received file download metadata:", fileInfo);
+        if (
+          ignoredFileNameSet.size > 0 &&
+          isLikelyUploadEchoMetadata(fileInfo)
+        ) {
+          emitStreamEvent({
+            type: "file_ignored",
+            source: "files_download_metadata",
+            responseUrl: response.url(),
+            metadataId: extractFileId(response.url()) || null,
+            fileName: null,
+            fileSizeBytes: null,
+            reason: "upload_echo_metadata_null_fields",
+            message:
+              "Ignored metadata response because file_name and file_size_bytes are null (likely upload echo)",
+          });
+          return;
+        }
         const downloadUrl = fileInfo?.download_url;
         if (typeof downloadUrl === "string" && downloadUrl) {
           const metadataId =
@@ -2045,6 +2290,19 @@ const collectChatGptDownloads = async (
         : responseFileId
           ? `${imageRun?.filePrefix || "download"}-${responseFileId}`
           : `${imageRun?.filePrefix || "download"}-${Date.now()}`;
+      if (shouldIgnoreCapturedFile({ fileName: nameHint })) {
+        emitStreamEvent({
+          type: "file_ignored",
+          source: "download_response",
+          responseUrl: response.url(),
+          metadataId: responseFileId || null,
+          fileName: nameHint || null,
+          reason: "matches_upload_reference_name",
+          message:
+            "Ignored captured file because it matches an uploaded reference filename",
+        });
+        return;
+      }
       let next = buildSaveResult();
       try {
         next = await saveDownloadRecord(
@@ -2152,6 +2410,19 @@ const collectChatGptDownloads = async (
   };
 
   pageInstance.on("response", onResponse);
+  if (waitForConvoStreamCompleted) {
+    pageInstance
+      .waitForRequest(
+        (candidateRequest) =>
+          Boolean(parseConvoStreamCompletedEvent(candidateRequest)),
+        { timeout: timeoutMs },
+      )
+      .then((request) => {
+        const details = parseConvoStreamCompletedEvent(request);
+        markConvoStreamCompleted(details);
+      })
+      .catch(() => undefined);
+  }
   timeoutTimer = setTimeout(() => finish(), timeoutMs);
 
   await new Promise((resolve) => {
@@ -2445,10 +2716,13 @@ const detectRequestedFileType = (value) => {
   return null;
 };
 
-const normalizeImagePrompt = (value) => {
+const normalizeImagePrompt = (value, { hasUploadFiles = false } = {}) => {
   const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed) {
     return "Please generate an image of a cat riding a bicycle.";
+  }
+  if (hasUploadFiles) {
+    return trimmed;
   }
   if (hasImageIntent(trimmed)) {
     return trimmed;
@@ -2509,18 +2783,29 @@ const resolveGenerationMode = (body) => {
   return "image";
 };
 
-const normalizePromptForMode = (value, generationMode = "image") =>
+const normalizePromptForMode = (
+  value,
+  generationMode = "image",
+  { hasUploadFiles = false } = {},
+) =>
   generationMode === "file"
     ? normalizeFilePrompt(value)
-    : normalizeImagePrompt(value);
+    : normalizeImagePrompt(value, { hasUploadFiles });
 
-const normalizeGenerationBatch = (body, { generationMode = "image" } = {}) => {
+const normalizeGenerationBatch = (
+  body,
+  { generationMode = "image", hasUploadFiles = false } = {},
+) => {
   const sourcePrompts = Array.isArray(body?.prompts)
     ? body.prompts
         .filter((entry) => typeof entry === "string" && entry.trim())
-        .map((entry) => normalizePromptForMode(entry, generationMode))
+        .map((entry) =>
+          normalizePromptForMode(entry, generationMode, { hasUploadFiles }),
+        )
     : [];
-  const fallbackPrompt = normalizePromptForMode(body?.prompt, generationMode);
+  const fallbackPrompt = normalizePromptForMode(body?.prompt, generationMode, {
+    hasUploadFiles,
+  });
   const countRaw = Number(body?.count);
   const requestedCount = Number.isInteger(countRaw) && countRaw > 0 ? countRaw : 1;
   const count = Math.min(requestedCount, 8);
@@ -2567,15 +2852,23 @@ const resolveUploadFiles = async (body) => {
   const resolved = [];
   const invalid = [];
   for (const entry of values) {
-    const filePath = resolve(process.cwd(), entry);
-    try {
-      const info = await stat(filePath);
-      if (!info.isFile()) {
-        invalid.push(entry);
-        continue;
+    const candidates = expandPathCandidates(entry, { baseDir: process.cwd() });
+    let selected = "";
+    for (const candidate of candidates) {
+      try {
+        const info = await stat(candidate);
+        if (!info.isFile()) {
+          continue;
+        }
+        selected = candidate;
+        break;
+      } catch {
+        // try next candidate
       }
-      resolved.push(filePath);
-    } catch {
+    }
+    if (selected) {
+      resolved.push(selected);
+    } else {
       invalid.push(entry);
     }
   }
@@ -2586,7 +2879,7 @@ const resolveUploadFiles = async (body) => {
     throw error;
   }
 
-  return resolved;
+  return [...new Set(resolved)];
 };
 
 const isChatGptTargetUrl = (value) =>
@@ -2662,10 +2955,12 @@ const buildContinuationPrompt = (
   previousContext,
   answerPrompt,
   generationMode = "image",
+  { hasUploadFiles = false } = {},
 ) => {
   const normalizedAnswer = normalizePromptForMode(
     answerPrompt,
     generationMode,
+    { hasUploadFiles },
   );
   const seed = {
     id: previousContext?.id ?? null,
@@ -2825,6 +3120,17 @@ const runChatGptPromptFlow = async (
       }
     }
   };
+  const ignoredUploadFileNames = [
+    ...new Set(
+      uploadFiles
+        .map((filePath) =>
+          typeof filePath === "string" && filePath.trim()
+            ? basename(filePath.trim())
+            : "",
+        )
+        .filter(Boolean),
+    ),
+  ];
   const collectDownloads = async () =>
     collectChatGptDownloads(activePage, {
       timeoutMs: config.imageTimeoutMs,
@@ -2833,6 +3139,8 @@ const runChatGptPromptFlow = async (
         generationMode === "image" ? Number.MAX_SAFE_INTEGER : config.imageMax,
       imageRun,
       requireFinalImageFrame: generationMode === "image",
+      waitForConvoStreamCompleted: generationMode === "image",
+      ignoreFileNames: ignoredUploadFileNames,
       onStreamEvent: (streamEvent) => {
         emitActivity({
           type: "stream_event",
@@ -2975,12 +3283,22 @@ const runChatGptPromptFlow = async (
           important: true,
         });
         mergeResult(await collectDownloads());
-        if ((result.savedCount ?? 0) > savedCountBefore) {
+        if (
+          (result.savedCount ?? 0) > savedCountBefore &&
+          generationMode === "image" &&
+          uploadFiles.length === 0
+        ) {
           return;
         }
-        console.warn(
-          "Stream capture enabled, but no streamed files were captured. Falling back to completion/download flow.",
-        );
+        if ((result.savedCount ?? 0) > savedCountBefore) {
+          console.log(
+            "Stream capture found candidate output(s). Continuing completion checks before finalizing run.",
+          );
+        } else {
+          console.warn(
+            "Stream capture enabled, but no streamed files were captured. Falling back to completion/download flow.",
+          );
+        }
       }
 
       if (generationMode === "image") {
@@ -3605,7 +3923,12 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const generationMode = resolveGenerationMode(body);
-      let prompts = normalizeGenerationBatch(body, { generationMode });
+      const uploadFiles = await resolveUploadFiles(body);
+      const hasUploadFiles = uploadFiles.length > 0;
+      let prompts = normalizeGenerationBatch(body, {
+        generationMode,
+        hasUploadFiles,
+      });
       if (sourceContext) {
         const followupPromptInput =
           answerPromptInput ||
@@ -3622,10 +3945,10 @@ const server = http.createServer(async (req, res) => {
             sourceContext,
             followupPromptInput,
             generationMode,
+            { hasUploadFiles },
           ),
         ];
       }
-      const uploadFiles = await resolveUploadFiles(body);
       const syncMode = body?.sync === true || body?.wait === true;
       const streamMode =
         body?.stream === true || body?.streamImages === true;
