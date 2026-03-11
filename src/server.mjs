@@ -298,8 +298,13 @@ const ensureStorageDir = async () => {
   await mkdir(config.storageDir, { recursive: true });
 };
 
-const ensureOutputDir = async () => {
-  await mkdir(config.outputDir, { recursive: true });
+const ensureOutputDir = async (dirPath = config.outputDir) => {
+  const targetDir =
+    typeof dirPath === "string" && dirPath.trim()
+      ? dirPath.trim()
+      : config.outputDir;
+  await mkdir(targetDir, { recursive: true });
+  return targetDir;
 };
 
 const ensureDownloadsDir = async () => {
@@ -348,14 +353,6 @@ const persistContextRun = async (record) => {
   const filePath = contextRunPath(safeId);
   await writeFile(filePath, JSON.stringify(payload, null, 2));
   return { payload, filePath };
-};
-
-const setOutputDir = async (value) => {
-  const trimmed = typeof value === "string" ? value.trim() : "";
-  if (!trimmed) return config.outputDir;
-  config.outputDir = resolvePathInput(trimmed, { baseDir: process.cwd() });
-  await ensureOutputDir();
-  return config.outputDir;
 };
 
 const hasSessionData = async (dir) => {
@@ -929,16 +926,29 @@ const retainLatestImageOnly = async (saveResult) => {
 };
 
 const createImageRun = (
-  { randomizeFileNames = false, generationMode = "image" } = {},
+  { randomizeFileNames = false, generationMode = "image", outputDir } = {},
 ) => {
   const normalizedMode = generationMode === "file" ? "file" : "image";
+  const resolvedOutputDir = resolvePathInput(
+    typeof outputDir === "string" && outputDir.trim()
+      ? outputDir.trim()
+      : config.outputDir,
+    { baseDir: process.cwd() },
+  );
   return {
     runId: randomUUID().split("-")[0],
     randomizeFileNames,
     nextFileIndex: 1,
     generationMode: normalizedMode,
     filePrefix: normalizedMode === "file" ? "file" : "image",
+    outputDir: resolvedOutputDir,
   };
+};
+
+const resolveRunOutputDir = (imageRun = null) => {
+  const runOutputDir =
+    typeof imageRun?.outputDir === "string" ? imageRun.outputDir.trim() : "";
+  return runOutputDir || config.outputDir;
 };
 
 const nextRandomBaseName = (imageRun) => {
@@ -951,7 +961,7 @@ const saveBufferToDisk = async (
   buffer,
   { fileName, contentType, metadataId = null, imageRun = null },
 ) => {
-  await ensureOutputDir();
+  const outputDir = await ensureOutputDir(resolveRunOutputDir(imageRun));
   const ext = extensionFromContentType(contentType);
   const normalizedName =
     typeof fileName === "string" && fileName.trim()
@@ -964,7 +974,7 @@ const saveBufferToDisk = async (
         `${imageRun?.filePrefix || "download"}-${Date.now()}`;
   let safeName = sanitizeFileName(baseName);
   safeName = applyExtension(safeName, ext);
-  const filePath = resolve(config.outputDir, safeName);
+  const filePath = resolve(outputDir, safeName);
   await writeFile(filePath, buffer);
   console.log("Saved file:", filePath);
   return {
@@ -1071,11 +1081,12 @@ let curlUnavailableLogged = false;
 const fetchDownloadWithCurl = async (
   pageInstance,
   url,
-  { timeoutMs = 25_000 } = {},
+  { timeoutMs = 25_000, outputDir = config.outputDir } = {},
 ) => {
+  const targetOutputDir = await ensureOutputDir(outputDir);
   const runId = randomUUID();
-  const headerPath = resolve(config.outputDir, `.curl-${runId}.headers`);
-  const bodyPath = resolve(config.outputDir, `.curl-${runId}.body`);
+  const headerPath = resolve(targetOutputDir, `.curl-${runId}.headers`);
+  const bodyPath = resolve(targetOutputDir, `.curl-${runId}.body`);
   const args = [
     "-sS",
     "-L",
@@ -1130,12 +1141,13 @@ const fetchDownloadWithCurl = async (
 const fetchDownloadWithRetry = async (
   pageInstance,
   url,
-  { attempts = 4, preferCurl = false } = {},
+  { attempts = 4, preferCurl = false, outputDir = config.outputDir } = {},
 ) => {
   if (preferCurl && config.preferCurlDownloads) {
     try {
       return await fetchDownloadWithCurl(pageInstance, url, {
         timeoutMs: config.curlTimeoutMs,
+        outputDir,
       });
     } catch (error) {
       const code = error && typeof error === "object" ? error.code : "";
@@ -1376,7 +1388,7 @@ const savePlaywrightDownload = async (
 
   if (typeof download.saveAs === "function") {
     try {
-      await ensureOutputDir();
+      const outputDir = await ensureOutputDir(resolveRunOutputDir(imageRun));
       const normalizedSuggestedName =
         typeof suggestedName === "string" && suggestedName.trim()
           ? basename(suggestedName.trim())
@@ -1392,7 +1404,7 @@ const savePlaywrightDownload = async (
         safeName = applyExtension(safeName, suggestedExt);
       }
       const targetPath = ensureUniqueOutputPath(
-        resolve(config.outputDir, safeName),
+        resolve(outputDir, safeName),
       );
       await Promise.race([
         download.saveAs(targetPath),
@@ -1836,12 +1848,14 @@ const saveDownloadRecord = async (pageInstance, record, { imageRun = null } = {}
   }
   if (record.downloadUrl) {
     const preferCurl = imageRun?.generationMode === "file";
+    const outputDir = resolveRunOutputDir(imageRun);
     const {
       buffer,
       contentType,
       fileName: fetchedFileName,
     } = await fetchDownloadWithRetry(pageInstance, record.downloadUrl, {
       preferCurl,
+      outputDir,
     });
     const saved = await saveBufferToDisk(buffer, {
       fileName:
@@ -1973,6 +1987,7 @@ const collectChatGptDownloads = async (
       .map((entry) => normalizeMatchFileName(entry))
       .filter(Boolean),
   );
+  const runOutputDir = resolveRunOutputDir(imageRun);
 
   const markConvoStreamCompleted = (details = null) => {
     if (convoStreamCompleted) return;
@@ -2229,6 +2244,7 @@ const collectChatGptDownloads = async (
             fileName: fetchedFileName,
           } = await fetchDownloadWithRetry(pageInstance, downloadUrl, {
             preferCurl: imageRun?.generationMode === "file",
+            outputDir: runOutputDir,
           });
           const shouldUseMetadataFileName =
             Boolean(metadataFileNameRaw) &&
@@ -2382,6 +2398,7 @@ const collectChatGptDownloads = async (
           fileName: fetchedFileName,
         } = await fetchDownloadWithRetry(pageInstance, downloadUrl, {
           preferCurl: imageRun?.generationMode === "file",
+          outputDir: runOutputDir,
         });
         const nameHint = fetchedFileName
           ? basename(fetchedFileName)
@@ -2441,7 +2458,7 @@ const collectChatGptDownloads = async (
     const latestSaved = savedFiles[savedFiles.length - 1];
     const latestExt = extensionFromContentType(latestSaved.contentType);
     const latestName = applyExtension("latest", latestExt);
-    const latestPath = resolve(config.outputDir, latestName);
+    const latestPath = resolve(runOutputDir, latestName);
     if (latestSaved.filePath !== latestPath) {
       await copyFile(latestSaved.filePath, latestPath);
       console.log("Saved latest file:", latestPath);
@@ -3470,6 +3487,7 @@ const runOpenPromptRequest = async (
   const contextId =
     sanitizeContextId(contextSeed?.id) || randomUUID();
   const contextFile = contextRunPath(contextId);
+  const runOutputDir = resolveRunOutputDir(imageRun);
   let contextRecord = {
     id: contextId,
     parentContextId: sanitizeContextId(contextSeed?.parentContextId) || null,
@@ -3481,7 +3499,7 @@ const runOpenPromptRequest = async (
     question: prompt,
     context: { question: prompt },
     effectiveUrl,
-    outputDir: config.outputDir,
+    outputDir: runOutputDir,
     uploadFiles,
     observedMetadataIds: [],
     observedOutputFiles: [],
@@ -3503,6 +3521,7 @@ const runOpenPromptRequest = async (
     events: [],
     assistantQuestion: null,
     assistantError: null,
+    result: buildSaveResult(),
   };
 
   const persistRunContext = async (patch) => {
@@ -3955,11 +3974,12 @@ const server = http.createServer(async (req, res) => {
       const randomizeFileNames =
         body?.randomName === true || body?.randomizeFileName === true;
       const multiPrompt = prompts.length > 1;
+      const requestOutputDir = outputDirInput
+        ? resolvePathInput(outputDirInput, { baseDir: process.cwd() })
+        : config.outputDir;
+      await ensureOutputDir(requestOutputDir);
 
       const ctx = await ensureContext();
-      if (outputDirInput) {
-        await setOutputDir(outputDirInput);
-      }
       const chatGptProjectUrl =
         projectUrlOverride || config.chatGptProjectUrl;
       const trimmedTarget = targetUrl.trim();
@@ -3969,7 +3989,7 @@ const server = http.createServer(async (req, res) => {
       const effectiveUrl =
         isChatGptBase && chatGptProjectUrl
           ? chatGptProjectUrl
-          : trimmedTarget || config.startUrl;
+          : trimmedTarget || config.startUrl || "https://chatgpt.com";
       if (effectiveUrl) {
         const runs = await Promise.all(
           prompts.map((prompt, index) =>
@@ -3978,7 +3998,11 @@ const server = http.createServer(async (req, res) => {
               prompt,
               syncMode,
               streamMode,
-              imageRun: createImageRun({ randomizeFileNames, generationMode }),
+              imageRun: createImageRun({
+                randomizeFileNames,
+                generationMode,
+                outputDir: requestOutputDir,
+              }),
               generationMode,
               useSharedPage: !multiPrompt && reusePage && index === 0,
               uploadFiles,
@@ -3994,7 +4018,7 @@ const server = http.createServer(async (req, res) => {
           return sendJson(res, 200, {
             ...runs[0],
             pages: ctx.pages().length,
-            outputDir: config.outputDir,
+            outputDir: requestOutputDir,
             promptCount: prompts.length,
             uploadCount: uploadFiles.length,
             sourceContextId: sourceContext?.id ?? null,
@@ -4013,7 +4037,7 @@ const server = http.createServer(async (req, res) => {
           generationMode,
           runs,
           pages: ctx.pages().length,
-          outputDir: config.outputDir,
+          outputDir: requestOutputDir,
         });
       }
       const activePage = await ensurePage();
@@ -4021,7 +4045,7 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         pageUrl: activePage.url(),
         pages: ctx.pages().length,
-        outputDir: config.outputDir,
+        outputDir: requestOutputDir,
         generationMode,
         stream: streamMode,
       });
